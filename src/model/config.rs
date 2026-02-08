@@ -98,6 +98,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 输入压缩配置
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -140,6 +144,86 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_thinking_strategy() -> String {
+    "discard".to_string()
+}
+
+fn default_8000() -> usize {
+    8000
+}
+
+fn default_80() -> usize {
+    80
+}
+
+fn default_40() -> usize {
+    40
+}
+
+fn default_6000() -> usize {
+    6000
+}
+
+fn default_4000() -> usize {
+    4000
+}
+
+/// 输入压缩配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default = "default_true")]
+    pub whitespace_compression: bool,
+
+    #[serde(default = "default_thinking_strategy")]
+    pub thinking_strategy: String,
+
+    #[serde(default = "default_8000")]
+    pub tool_result_max_chars: usize,
+
+    #[serde(default = "default_80")]
+    pub tool_result_head_lines: usize,
+
+    #[serde(default = "default_40")]
+    pub tool_result_tail_lines: usize,
+
+    #[serde(default = "default_6000")]
+    pub tool_use_input_max_chars: usize,
+
+    #[serde(default = "default_4000")]
+    pub tool_description_max_chars: usize,
+
+    #[serde(default)]
+    pub max_history_turns: usize,
+
+    #[serde(default)]
+    pub max_history_chars: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            whitespace_compression: true,
+            thinking_strategy: default_thinking_strategy(),
+            tool_result_max_chars: default_8000(),
+            tool_result_head_lines: default_80(),
+            tool_result_tail_lines: default_40(),
+            tool_use_input_max_chars: default_6000(),
+            tool_description_max_chars: default_4000(),
+            max_history_turns: 0,
+            max_history_chars: 0,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -164,6 +248,7 @@ impl Default for Config {
             redis_url: None,
             cache_debug_logging: false,
             load_balancing_mode: default_load_balancing_mode(),
+            compression: CompressionConfig::default(),
             config_path: None,
         }
     }

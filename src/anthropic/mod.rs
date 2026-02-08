@@ -23,6 +23,7 @@
 //! ```
 
 pub mod cache;
+mod compressor;
 mod converter;
 mod handlers;
 mod middleware;

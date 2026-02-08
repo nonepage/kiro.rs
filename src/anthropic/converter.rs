@@ -11,6 +11,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::CompressionConfig;
 
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -203,7 +204,10 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    compression_config: &CompressionConfig,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -245,7 +249,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
-    let mut tools = convert_tools(&req.tools);
+    let mut tools = convert_tools(&req.tools, compression_config.tool_description_max_chars);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id)?;
@@ -298,12 +302,25 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
+
+    let compression_stats = super::compressor::compress(&mut conversation_state, compression_config);
+    if compression_stats.total_saved() > 0 || compression_stats.history_turns_removed > 0 {
+        tracing::info!(
+            whitespace_saved = compression_stats.whitespace_saved,
+            thinking_saved = compression_stats.thinking_saved,
+            tool_result_saved = compression_stats.tool_result_saved,
+            tool_use_input_saved = compression_stats.tool_use_input_saved,
+            history_turns_removed = compression_stats.history_turns_removed,
+            total_saved = compression_stats.total_saved(),
+            "compressed converted conversation state"
+        );
+    }
 
     Ok(ConversionResult { conversation_state })
 }
@@ -522,7 +539,10 @@ fn remove_orphaned_tool_uses(
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    max_description_chars: usize,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -549,7 +569,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
             }
 
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
+            let description = match description.char_indices().nth(max_description_chars) {
                 Some((idx, _)) => description[..idx].to_string(),
                 None => description,
             };
