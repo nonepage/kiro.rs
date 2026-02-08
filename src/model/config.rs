@@ -172,6 +172,14 @@ fn default_4000() -> usize {
     4000
 }
 
+fn default_80_turns() -> usize {
+    80
+}
+
+fn default_400k() -> usize {
+    400_000
+}
+
 /// 输入压缩配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,11 +207,9 @@ pub struct CompressionConfig {
 
     #[serde(default = "default_4000")]
     pub tool_description_max_chars: usize,
-
-    #[serde(default)]
+    #[serde(default = "default_80_turns")]
     pub max_history_turns: usize,
-
-    #[serde(default)]
+    #[serde(default = "default_400k")]
     pub max_history_chars: usize,
 }
 
@@ -218,8 +224,8 @@ impl Default for CompressionConfig {
             tool_result_tail_lines: default_40(),
             tool_use_input_max_chars: default_6000(),
             tool_description_max_chars: default_4000(),
-            max_history_turns: 0,
-            max_history_chars: 0,
+            max_history_turns: default_80_turns(),
+            max_history_chars: default_400k(),
         }
     }
 }
