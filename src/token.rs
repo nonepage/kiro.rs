@@ -11,6 +11,7 @@ use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
 use crate::http_client::{ProxyConfig, build_client};
+use crate::image::estimate_image_tokens;
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
@@ -204,8 +205,19 @@ fn count_all_tokens_local(
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
+                // 文本内容
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     total += count_tokens(text);
+                }
+                // 图片内容
+                if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    if let Some(source) = item.get("source") {
+                        if let Some(data) = source.get("data").and_then(|v| v.as_str()) {
+                            if let Some((tokens, _, _)) = estimate_image_tokens(data) {
+                                total += tokens;
+                            }
+                        }
+                    }
                 }
             }
         }

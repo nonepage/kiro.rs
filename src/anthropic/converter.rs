@@ -4,6 +4,7 @@
 
 use uuid::Uuid;
 
+use crate::image::process_image;
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
@@ -89,6 +90,23 @@ When the Write or Edit tool has content size limits, always comply silently. \
 Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
+
+fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
+    if has_non_text_payload && content.trim().is_empty() {
+        return " ".to_string();
+    }
+    content
+}
+
+fn count_images_in_content(content: &serde_json::Value) -> usize {
+    match content {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("image"))
+            .count(),
+        _ => 0,
+    }
+}
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
@@ -245,14 +263,21 @@ pub fn convert_request(
     let chat_trigger_type = determine_chat_trigger_type(req);
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    let total_image_count: usize = messages
+        .iter()
+        .map(|msg| count_images_in_content(&msg.content))
+        .sum();
+
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, tool_results) =
+        process_message_content(&last_message.content, compression_config, total_image_count)?;
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools, compression_config.tool_description_max_chars);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id)?;
+    let mut history =
+        build_history(req, messages, &model_id, compression_config, total_image_count)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -283,13 +308,14 @@ pub fn convert_request(
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !validated_tool_results.is_empty() {
+    let has_tool_results = !validated_tool_results.is_empty();
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    let content = non_empty_content_or_space(text_content, !images.is_empty() || has_tool_results);
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -334,6 +360,8 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
+    compression_config: &CompressionConfig,
+    total_image_count: usize,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -355,7 +383,28 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                    match process_image(
+                                        &source.data,
+                                        &format,
+                                        compression_config,
+                                        total_image_count,
+                                    ) {
+                                        Ok(result) => {
+                                            if result.was_resized {
+                                                tracing::info!(
+                                                    original_size = ?result.original_size,
+                                                    final_size = ?result.final_size,
+                                                    tokens = result.tokens,
+                                                    "processed image payload"
+                                                );
+                                            }
+                                            images.push(KiroImage::from_base64(format, result.data));
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(error = %err, "failed to process image payload, using original data");
+                                            images.push(KiroImage::from_base64(format, source.data));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -627,6 +676,8 @@ fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
     model_id: &str,
+    compression_config: &CompressionConfig,
+    total_image_count: usize,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -695,7 +746,12 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(
+                    &user_buffer,
+                    model_id,
+                    compression_config,
+                    total_image_count,
+                )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -712,7 +768,12 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(
+            &user_buffer,
+            model_id,
+            compression_config,
+            total_image_count,
+        )?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -727,13 +788,16 @@ fn build_history(
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    compression_config: &CompressionConfig,
+    total_image_count: usize,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content(&msg.content, compression_config, total_image_count)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -741,7 +805,10 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let content = non_empty_content_or_space(
+        content_parts.join("\n"),
+        !all_images.is_empty() || !all_tool_results.is_empty(),
+    );
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 

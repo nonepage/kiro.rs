@@ -180,6 +180,22 @@ fn default_400k() -> usize {
     400_000
 }
 
+fn default_image_max_long_edge() -> u32 {
+    1568
+}
+
+fn default_image_max_pixels_single() -> u32 {
+    1_150_000
+}
+
+fn default_image_max_pixels_multi() -> u32 {
+    4_000_000
+}
+
+fn default_image_multi_threshold() -> usize {
+    20
+}
+
 /// 输入压缩配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +227,18 @@ pub struct CompressionConfig {
     pub max_history_turns: usize,
     #[serde(default = "default_400k")]
     pub max_history_chars: usize,
+    /// 图片长边最大像素，默认 1568（Anthropic 推荐值，超过会缩放）
+    #[serde(default = "default_image_max_long_edge")]
+    pub image_max_long_edge: u32,
+    /// 单张图片最大总像素，默认 1_150_000（约 1600 tokens）
+    #[serde(default = "default_image_max_pixels_single")]
+    pub image_max_pixels_single: u32,
+    /// 多图模式下单张图片最大总像素，默认 4_000_000（2000×2000）
+    #[serde(default = "default_image_max_pixels_multi")]
+    pub image_max_pixels_multi: u32,
+    /// 触发多图限制的图片数量阈值，默认 20
+    #[serde(default = "default_image_multi_threshold")]
+    pub image_multi_threshold: usize,
 }
 
 impl Default for CompressionConfig {
@@ -226,6 +254,10 @@ impl Default for CompressionConfig {
             tool_description_max_chars: default_4000(),
             max_history_turns: default_80_turns(),
             max_history_chars: default_400k(),
+            image_max_long_edge: default_image_max_long_edge(),
+            image_max_pixels_single: default_image_max_pixels_single(),
+            image_max_pixels_multi: default_image_max_pixels_multi(),
+            image_multi_threshold: default_image_multi_threshold(),
         }
     }
 }

@@ -3,6 +3,7 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+pub mod image;
 mod kiro;
 mod model;
 pub mod token;
