@@ -21,6 +21,7 @@ pub struct CompressionStats {
     pub tool_result_saved: usize,
     pub tool_use_input_saved: usize,
     pub history_turns_removed: usize,
+    pub history_bytes_saved: usize,
 }
 
 impl CompressionStats {
@@ -30,6 +31,7 @@ impl CompressionStats {
             + self.thinking_saved
             + self.tool_result_saved
             + self.tool_use_input_saved
+            + self.history_bytes_saved
     }
 }
 
@@ -71,8 +73,22 @@ pub fn compress(state: &mut ConversationState, config: &CompressionConfig) -> Co
 
     // 5. 历史截断（最后手段）
     if config.max_history_turns > 0 || config.max_history_chars > 0 {
-        stats.history_turns_removed =
+        let (turns, bytes) =
             compress_history_pass(state, config.max_history_turns, config.max_history_chars);
+        stats.history_turns_removed = turns;
+        stats.history_bytes_saved = bytes;
+    }
+
+    // 历史截断会破坏 tool_use(tool_uses) 与 tool_result(tool_results) 的跨消息配对：
+    // assistant(tool_use) → user(tool_result)。
+    // 若留下孤立 tool_use/tool_result，上游会返回 400 "Improperly formed request"。
+    let (removed_tool_uses, removed_tool_results) = repair_tool_pairing_pass(state);
+    if removed_tool_uses > 0 || removed_tool_results > 0 {
+        tracing::debug!(
+            removed_tool_uses,
+            removed_tool_results,
+            "压缩后已修复 tool_use/tool_result 配对"
+        );
     }
 
     stats
@@ -184,7 +200,7 @@ fn remove_thinking_blocks(text: &str) -> String {
         }
     }
     result.push_str(remaining);
-    result.trim().to_string()
+    result
 }
 
 /// 截断 `<thinking>...</thinking>` 块内容，保留前 N 个字符
@@ -227,7 +243,8 @@ fn smart_truncate_by_lines(
     head_lines: usize,
     tail_lines: usize,
 ) -> (String, usize) {
-    if text.len() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return (text.to_string(), 0);
     }
 
@@ -237,7 +254,7 @@ fn smart_truncate_by_lines(
     if total_lines <= head_lines + tail_lines {
         let half = max_chars / 2;
         let head = safe_char_truncate(text, half);
-        let tail_chars = max_chars.saturating_sub(head.len());
+        let tail_chars = max_chars.saturating_sub(head.chars().count());
         let tail_start = text
             .char_indices()
             .rev()
@@ -245,7 +262,7 @@ fn smart_truncate_by_lines(
             .map(|(i, _)| i)
             .unwrap_or(0);
         let tail = &text[tail_start..];
-        let omitted = text.len().saturating_sub(head.len() + tail.len());
+        let omitted = char_count.saturating_sub(head.chars().count() + tail.chars().count());
         let result = format!("{}\n... [{} chars omitted] ...\n{}", head, omitted, tail);
         let saved = text.len().saturating_sub(result.len());
         return (result, saved);
@@ -254,12 +271,20 @@ fn smart_truncate_by_lines(
     let head_part: String = lines[..head_lines].join("\n");
     let tail_part: String = lines[total_lines - tail_lines..].join("\n");
     let omitted_lines = total_lines - head_lines - tail_lines;
-    let omitted_chars = text.len().saturating_sub(head_part.len() + tail_part.len());
+    let omitted_chars =
+        char_count.saturating_sub(head_part.chars().count() + tail_part.chars().count());
 
-    let result = format!(
+    let mut result = format!(
         "{}\n... [{} lines omitted ({} chars)] ...\n{}",
         head_part, omitted_lines, omitted_chars, tail_part
     );
+
+    // 硬截断兜底：确保结果不超过 max_chars
+    if result.chars().count() > max_chars {
+        let truncated = safe_char_truncate(&result, max_chars);
+        result = truncated.to_string();
+    }
+
     let saved = text.len().saturating_sub(result.len());
     (result, saved)
 }
@@ -313,19 +338,17 @@ fn truncate_tool_result_content(
     let mut saved = 0usize;
 
     for map in content.iter_mut() {
-        if let Some(serde_json::Value::String(text)) = map.get_mut("text") {
-            if text.len() > max_chars {
-                let (truncated, s) =
-                    smart_truncate_by_lines(text, max_chars, head_lines, tail_lines);
-                saved += s;
-                *text = truncated;
-            }
+        if let Some(serde_json::Value::String(text)) = map.get_mut("text")
+            && text.chars().count() > max_chars
+        {
+            let (truncated, s) = smart_truncate_by_lines(text, max_chars, head_lines, tail_lines);
+            saved += s;
+            *text = truncated;
         }
     }
 
     saved
 }
-
 
 // ============ tool_use input 截断 ============
 
@@ -334,13 +357,13 @@ fn compress_tool_use_inputs_pass(state: &mut ConversationState, max_chars: usize
     let mut saved = 0usize;
 
     for msg in &mut state.history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses.iter_mut() {
-                    let serialized = serde_json::to_string(&tool_use.input).unwrap_or_default();
-                    if serialized.len() > max_chars {
-                        saved += truncate_json_value_strings(&mut tool_use.input, max_chars);
-                    }
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            for tool_use in tool_uses.iter_mut() {
+                let serialized = serde_json::to_string(&tool_use.input).unwrap_or_default();
+                if serialized.chars().count() > max_chars {
+                    saved += truncate_json_value_strings(&mut tool_use.input, max_chars);
                 }
             }
         }
@@ -355,15 +378,27 @@ fn truncate_json_value_strings(value: &mut serde_json::Value, max_chars: usize) 
 
     match value {
         serde_json::Value::String(s) => {
-            if s.len() > max_chars {
+            let original_char_count = s.chars().count();
+            if original_char_count > max_chars {
                 let original_len = s.len();
-                let truncated = safe_char_truncate(s, max_chars);
-                *s = format!(
+                let truncated = safe_char_truncate(s, max_chars).to_string();
+                let omitted_chars = original_char_count.saturating_sub(max_chars);
+
+                // 仅当“带标记版本”确实更短时才附加标记，避免在边界场景（仅略超阈值）
+                // 反而把字符串变长，导致压缩失效。
+                let with_marker = format!(
                     "{}...[truncated {} chars]",
-                    truncated,
-                    original_len - truncated.len()
+                    truncated.as_str(),
+                    omitted_chars
                 );
-                saved += original_len.saturating_sub(s.len());
+                let new_value = if with_marker.len() < original_len {
+                    with_marker
+                } else {
+                    truncated
+                };
+
+                saved += original_len.saturating_sub(new_value.len());
+                *s = new_value;
             }
         }
         serde_json::Value::Object(map) => {
@@ -382,23 +417,35 @@ fn truncate_json_value_strings(value: &mut serde_json::Value, max_chars: usize) 
     saved
 }
 
-
 // ============ 历史截断 ============
 
 /// 历史截断：保留前 2 条（系统消息对），从前往后成对移除
+///
+/// 返回 (移除的轮数, 移除的字节数)
 fn compress_history_pass(
     state: &mut ConversationState,
     max_turns: usize,
     max_chars: usize,
-) -> usize {
+) -> (usize, usize) {
     let mut removed = 0usize;
+    let mut bytes_saved = 0usize;
     let preserve_count = 2;
+
+    /// 计算一条消息的字节数
+    fn msg_bytes(msg: &Message) -> usize {
+        match msg {
+            Message::User(u) => u.user_input_message.content.len(),
+            Message::Assistant(a) => a.assistant_response_message.content.len(),
+        }
+    }
 
     // 按轮数截断
     if max_turns > 0 {
         let max_messages = preserve_count + max_turns * 2;
         while state.history.len() > max_messages && state.history.len() > preserve_count + 2 {
+            bytes_saved += msg_bytes(&state.history[preserve_count]);
             state.history.remove(preserve_count);
+            bytes_saved += msg_bytes(&state.history[preserve_count]);
             state.history.remove(preserve_count);
             removed += 1;
         }
@@ -411,8 +458,8 @@ fn compress_history_pass(
                 .history
                 .iter()
                 .map(|msg| match msg {
-                    Message::User(u) => u.user_input_message.content.len(),
-                    Message::Assistant(a) => a.assistant_response_message.content.len(),
+                    Message::User(u) => u.user_input_message.content.chars().count(),
+                    Message::Assistant(a) => a.assistant_response_message.content.chars().count(),
                 })
                 .sum();
 
@@ -420,13 +467,97 @@ fn compress_history_pass(
                 break;
             }
 
+            bytes_saved += msg_bytes(&state.history[preserve_count]);
             state.history.remove(preserve_count);
+            bytes_saved += msg_bytes(&state.history[preserve_count]);
             state.history.remove(preserve_count);
             removed += 1;
         }
     }
 
-    removed
+    (removed, bytes_saved)
+}
+
+/// 修复 tool_use/tool_result 配对（压缩后）。
+///
+/// 目标：
+/// - 移除 history/current 中孤立的 tool_result（其 tool_use_id 在 history 的 tool_use 中不存在）
+/// - 移除 history 中孤立的 tool_use（其 tool_use_id 在 history/current 的 tool_result 中不存在）
+///
+/// 返回 (移除的 tool_use 数, 移除的 tool_result 数)。
+fn repair_tool_pairing_pass(state: &mut ConversationState) -> (usize, usize) {
+    use std::collections::HashSet;
+
+    // 1) 收集 history 内所有 tool_use_id（上游通常要求 tool_result 必须能在历史 tool_use 中找到）
+    let mut tool_use_ids: HashSet<String> = HashSet::new();
+    for msg in &state.history {
+        if let Message::Assistant(a) = msg
+            && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+        {
+            for tu in tool_uses {
+                tool_use_ids.insert(tu.tool_use_id.clone());
+            }
+        }
+    }
+
+    // 2) 移除 history/current 中孤立 tool_result（没有对应 tool_use）
+    let mut removed_tool_results = 0usize;
+
+    for msg in &mut state.history {
+        if let Message::User(u) = msg {
+            let results = &mut u.user_input_message.user_input_message_context.tool_results;
+            let before = results.len();
+            results.retain(|tr| tool_use_ids.contains(&tr.tool_use_id));
+            removed_tool_results += before - results.len();
+        }
+    }
+
+    {
+        let results = &mut state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        let before = results.len();
+        results.retain(|tr| tool_use_ids.contains(&tr.tool_use_id));
+        removed_tool_results += before - results.len();
+    }
+
+    // 3) 收集 history/current 内所有 tool_result 的 tool_use_id
+    let mut tool_result_ids: HashSet<String> = HashSet::new();
+    for msg in &state.history {
+        if let Message::User(u) = msg {
+            for tr in &u.user_input_message.user_input_message_context.tool_results {
+                tool_result_ids.insert(tr.tool_use_id.clone());
+            }
+        }
+    }
+    for tr in &state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tool_results
+    {
+        tool_result_ids.insert(tr.tool_use_id.clone());
+    }
+
+    // 4) 移除 history 内孤立 tool_use（没有对应 tool_result）
+    let mut removed_tool_uses = 0usize;
+    for msg in &mut state.history {
+        if let Message::Assistant(a) = msg
+            && let Some(ref mut tool_uses) = a.assistant_response_message.tool_uses
+        {
+            let before = tool_uses.len();
+            tool_uses.retain(|tu| tool_result_ids.contains(&tu.tool_use_id));
+            removed_tool_uses += before - tool_uses.len();
+
+            if tool_uses.is_empty() {
+                a.assistant_response_message.tool_uses = None;
+            }
+        }
+    }
+
+    (removed_tool_uses, removed_tool_results)
 }
 
 // ============ 工具函数 ============
@@ -604,11 +735,12 @@ mod tests {
             ToolUseEntry::new("t1", "write").with_input(long_input),
         ]);
 
+        // tool_use 必须有对应的 tool_result（Kiro 要求严格配对），否则会被压缩后的修复逻辑移除。
+        let current = UserInputMessage::new(" ", "claude-sonnet-4.5").with_context(
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success("t1", "ok")]),
+        );
         let mut state = ConversationState::new("test")
-            .with_current_message(CurrentMessage::new(UserInputMessage::new(
-                "next",
-                "claude-sonnet-4.5",
-            )))
+            .with_current_message(CurrentMessage::new(current))
             .with_history(vec![
                 Message::User(HistoryUserMessage::new("do it", "claude-sonnet-4.5")),
                 Message::Assistant(HistoryAssistantMessage {
@@ -622,6 +754,87 @@ mod tests {
         };
         let stats = compress(&mut state, &config);
         assert!(stats.tool_use_input_saved > 0);
+    }
+
+    #[test]
+    fn test_tool_use_input_truncation_does_not_expand_near_threshold() {
+        let long_input = serde_json::json!({
+            "content": "a".repeat(101)
+        });
+        let mut assistant_msg = AssistantMessage::new("using tool");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("t1", "write").with_input(long_input),
+        ]);
+
+        let current = UserInputMessage::new(" ", "claude-sonnet-4.5").with_context(
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success("t1", "ok")]),
+        );
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(current))
+            .with_history(vec![
+                Message::User(HistoryUserMessage::new("do it", "claude-sonnet-4.5")),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: assistant_msg,
+                }),
+            ]);
+
+        let config = CompressionConfig {
+            tool_use_input_max_chars: 100,
+            ..Default::default()
+        };
+        let stats = compress(&mut state, &config);
+        assert!(stats.tool_use_input_saved > 0);
+
+        if let Message::Assistant(a) = &state.history[1]
+            && let Some(tool_uses) = &a.assistant_response_message.tool_uses
+            && let Some(content) = tool_uses[0].input["content"].as_str()
+        {
+            // 101 字符略超阈值时，不应追加标记导致更长；应退化为纯截断
+            let expected = "a".repeat(100);
+            assert_eq!(content, expected.as_str());
+        } else {
+            panic!("tool_use input content should exist");
+        }
+    }
+
+    #[test]
+    fn test_tool_use_input_truncation_unicode_under_limit_is_unchanged() {
+        let original = "你".repeat(60); // 60 chars, but 180 bytes
+        let long_input = serde_json::json!({
+            "content": original.clone()
+        });
+        let mut assistant_msg = AssistantMessage::new("using tool");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("t1", "write").with_input(long_input),
+        ]);
+
+        let current = UserInputMessage::new(" ", "claude-sonnet-4.5").with_context(
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success("t1", "ok")]),
+        );
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(current))
+            .with_history(vec![
+                Message::User(HistoryUserMessage::new("do it", "claude-sonnet-4.5")),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: assistant_msg,
+                }),
+            ]);
+
+        let config = CompressionConfig {
+            tool_use_input_max_chars: 100,
+            ..Default::default()
+        };
+        let stats = compress(&mut state, &config);
+        assert_eq!(stats.tool_use_input_saved, 0);
+
+        if let Message::Assistant(a) = &state.history[1]
+            && let Some(tool_uses) = &a.assistant_response_message.tool_uses
+            && let Some(content) = tool_uses[0].input["content"].as_str()
+        {
+            assert_eq!(content, original.as_str());
+        } else {
+            panic!("tool_use input content should exist");
+        }
     }
 
     #[test]
@@ -644,6 +857,76 @@ mod tests {
         // 第一对应该是 system pair
         if let Message::User(u) = &state.history[0] {
             assert!(u.user_input_message.content.contains("system prompt"));
+        }
+    }
+
+    #[test]
+    fn test_history_truncation_repairs_tool_pairing() {
+        // 构造典型 tool_use → tool_result 跨消息链路：
+        // assistant(tool_use) 紧跟 user(tool_result)。
+        // 当按 user+assistant 成对从前往后截断时，容易删掉 tool_use 而保留 tool_result。
+        let tool_use_id = "tooluse_1";
+
+        let system_user = Message::User(HistoryUserMessage::new(
+            "system",
+            "claude-sonnet-4.5",
+        ));
+        let system_assistant = Message::Assistant(HistoryAssistantMessage::new(
+            "I will follow these instructions.",
+        ));
+
+        let user1 = Message::User(HistoryUserMessage::new("do something", "claude-sonnet-4.5"));
+
+        let tool_use = ToolUseEntry::new(tool_use_id, "Read")
+            .with_input(serde_json::json!({"path": "a.txt"}));
+        let assistant1 = Message::Assistant(HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new(" ").with_tool_uses(vec![tool_use]),
+        });
+
+        let tool_result_ctx = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success(tool_use_id, "ok")]);
+        let user2 = Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new(" ", "claude-sonnet-4.5")
+                .with_context(tool_result_ctx),
+        });
+
+        let assistant2 = Message::Assistant(HistoryAssistantMessage::new("done"));
+
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "next",
+                "claude-sonnet-4.5",
+            )))
+            .with_history(vec![
+                system_user,
+                system_assistant,
+                user1,
+                assistant1,
+                user2,
+                assistant2,
+            ]);
+
+        // 将历史限制到 1 轮（2+2=4 条），触发截断：会移除 user1+assistant1。
+        // 若不修复，user2 中的 tool_result 会变成 orphan，导致上游 400。
+        let config = CompressionConfig {
+            max_history_turns: 1,
+            max_history_chars: 0,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        // history 中不应存在 tool_result（因为对应 tool_use 已被截断移除）
+        for msg in &state.history {
+            if let Message::User(u) = msg {
+                assert!(
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
+                    "history 中不应残留孤立 tool_result"
+                );
+            }
         }
     }
 
