@@ -21,6 +21,11 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+const ADAPTIVE_COMPRESSION_MAX_ITERS: usize = 32;
+const ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS: usize = 512;
+const ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS: usize = 256;
+const ADAPTIVE_HISTORY_PRESERVE_MESSAGES: usize = 2;
+
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -30,6 +35,95 @@ use super::types::{
 };
 use super::websearch;
 use crate::anthropic::cache;
+
+fn is_input_too_long_error(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || s.contains("Input is too long")
+        || s.contains("Improperly formed request")
+}
+
+fn is_quota_exhausted_error(err: &Error) -> bool {
+    err.to_string().contains("所有凭据已用尽")
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AdaptiveCompressionOutcome {
+    initial_bytes: usize,
+    final_bytes: usize,
+    iters: usize,
+    additional_history_turns_removed: usize,
+    final_tool_result_max_chars: usize,
+    final_tool_use_input_max_chars: usize,
+}
+
+fn adaptive_shrink_request_body(
+    kiro_request: &mut KiroRequest,
+    base_config: &crate::model::config::CompressionConfig,
+    max_body: usize,
+    request_body: &mut String,
+) -> Result<Option<AdaptiveCompressionOutcome>, serde_json::Error> {
+    if max_body == 0 || request_body.len() <= max_body || !base_config.enabled {
+        return Ok(None);
+    }
+
+    let mut outcome = AdaptiveCompressionOutcome {
+        initial_bytes: request_body.len(),
+        final_bytes: request_body.len(),
+        iters: 0,
+        additional_history_turns_removed: 0,
+        final_tool_result_max_chars: base_config.tool_result_max_chars,
+        final_tool_use_input_max_chars: base_config.tool_use_input_max_chars,
+    };
+
+    let mut adaptive_config = base_config.clone();
+
+    for _ in 0..ADAPTIVE_COMPRESSION_MAX_ITERS {
+        if request_body.len() <= max_body {
+            break;
+        }
+
+        let mut changed = false;
+
+        if adaptive_config.tool_result_max_chars > ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS {
+            let next = (adaptive_config.tool_result_max_chars * 3 / 4)
+                .max(ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS);
+            if next < adaptive_config.tool_result_max_chars {
+                adaptive_config.tool_result_max_chars = next;
+                changed = true;
+            }
+        } else if adaptive_config.tool_use_input_max_chars > ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS {
+            let next = (adaptive_config.tool_use_input_max_chars * 3 / 4)
+                .max(ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS);
+            if next < adaptive_config.tool_use_input_max_chars {
+                adaptive_config.tool_use_input_max_chars = next;
+                changed = true;
+            }
+        } else {
+            let history = &mut kiro_request.conversation_state.history;
+            if history.len() > ADAPTIVE_HISTORY_PRESERVE_MESSAGES + 2 {
+                history.remove(ADAPTIVE_HISTORY_PRESERVE_MESSAGES);
+                history.remove(ADAPTIVE_HISTORY_PRESERVE_MESSAGES);
+                outcome.additional_history_turns_removed += 1;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        super::compressor::compress(&mut kiro_request.conversation_state, &adaptive_config);
+        *request_body = serde_json::to_string(kiro_request)?;
+        outcome.iters += 1;
+        outcome.final_bytes = request_body.len();
+    }
+
+    outcome.final_tool_result_max_chars = adaptive_config.tool_result_max_chars;
+    outcome.final_tool_use_input_max_chars = adaptive_config.tool_use_input_max_chars;
+
+    Ok(Some(outcome))
+}
 
 /// 从 HeaderMap 中提取 API Key（用于缓存隔离）
 fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
@@ -291,12 +385,12 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let mut request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -310,6 +404,55 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    let max_body = state.compression_config.max_request_body_bytes;
+    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
+        match adaptive_shrink_request_body(
+            &mut kiro_request,
+            &state.compression_config,
+            max_body,
+            &mut request_body,
+        ) {
+            Ok(Some(outcome)) => {
+                tracing::warn!(
+                    initial_bytes = outcome.initial_bytes,
+                    final_bytes = outcome.final_bytes,
+                    threshold = max_body,
+                    iters = outcome.iters,
+                    additional_history_turns_removed = outcome.additional_history_turns_removed,
+                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
+                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
+                    "applied adaptive request shrinking before upstream call"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("Failed to serialize request: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if max_body > 0 && request_body.len() > max_body {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!(
+                    "Request too large ({} bytes, limit {}). Reduce conversation history or tool output.",
+                    request_body.len(),
+                    max_body
+                ),
+            )),
+        )
+            .into_response();
+    }
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -808,12 +951,12 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
     };
 
-    let request_body = match serde_json::to_string(&kiro_request) {
+    let mut request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -827,6 +970,55 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    let max_body = state.compression_config.max_request_body_bytes;
+    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
+        match adaptive_shrink_request_body(
+            &mut kiro_request,
+            &state.compression_config,
+            max_body,
+            &mut request_body,
+        ) {
+            Ok(Some(outcome)) => {
+                tracing::warn!(
+                    initial_bytes = outcome.initial_bytes,
+                    final_bytes = outcome.final_bytes,
+                    threshold = max_body,
+                    iters = outcome.iters,
+                    additional_history_turns_removed = outcome.additional_history_turns_removed,
+                    final_tool_result_max_chars = outcome.final_tool_result_max_chars,
+                    final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
+                    "applied adaptive request shrinking before upstream call"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("Failed to serialize request: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if max_body > 0 && request_body.len() > max_body {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!(
+                    "Request too large ({} bytes, limit {}). Reduce conversation history or tool output.",
+                    request_body.len(),
+                    max_body
+                ),
+            )),
+        )
+            .into_response();
+    }
 
     tracing::debug!("Kiro request body: {}", request_body);
 

@@ -196,6 +196,10 @@ fn default_image_multi_threshold() -> usize {
     20
 }
 
+fn default_max_request_body_bytes() -> usize {
+    4_718_592
+}
+
 /// 输入压缩配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,6 +243,9 @@ pub struct CompressionConfig {
     /// 触发多图限制的图片数量阈值，默认 20
     #[serde(default = "default_image_multi_threshold")]
     pub image_multi_threshold: usize,
+
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
 }
 
 impl Default for CompressionConfig {
@@ -258,6 +265,7 @@ impl Default for CompressionConfig {
             image_max_pixels_single: default_image_max_pixels_single(),
             image_max_pixels_multi: default_image_max_pixels_multi(),
             image_multi_threshold: default_image_multi_threshold(),
+            max_request_body_bytes: default_max_request_body_bytes(),
         }
     }
 }
