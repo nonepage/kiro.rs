@@ -25,6 +25,7 @@ const ADAPTIVE_COMPRESSION_MAX_ITERS: usize = 32;
 const ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS: usize = 512;
 const ADAPTIVE_MIN_TOOL_USE_INPUT_MAX_CHARS: usize = 256;
 const ADAPTIVE_HISTORY_PRESERVE_MESSAGES: usize = 2;
+const ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS: usize = 8192;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
@@ -55,6 +56,26 @@ struct AdaptiveCompressionOutcome {
     additional_history_turns_removed: usize,
     final_tool_result_max_chars: usize,
     final_tool_use_input_max_chars: usize,
+    final_message_content_max_chars: usize,
+}
+
+fn total_image_bytes(kiro_request: &KiroRequest) -> usize {
+    let state = &kiro_request.conversation_state;
+    let mut total = 0usize;
+
+    for img in &state.current_message.user_input_message.images {
+        total += img.source.bytes.len();
+    }
+
+    for msg in &state.history {
+        if let crate::kiro::model::requests::conversation::Message::User(user_msg) = msg {
+            for img in &user_msg.user_input_message.images {
+                total += img.source.bytes.len();
+            }
+        }
+    }
+
+    total
 }
 
 fn adaptive_shrink_request_body(
@@ -63,7 +84,9 @@ fn adaptive_shrink_request_body(
     max_body: usize,
     request_body: &mut String,
 ) -> Result<Option<AdaptiveCompressionOutcome>, serde_json::Error> {
-    if max_body == 0 || request_body.len() <= max_body || !base_config.enabled {
+    let img_bytes = total_image_bytes(kiro_request);
+    let effective_len = request_body.len().saturating_sub(img_bytes);
+    if max_body == 0 || effective_len <= max_body || !base_config.enabled {
         return Ok(None);
     }
 
@@ -74,12 +97,31 @@ fn adaptive_shrink_request_body(
         additional_history_turns_removed: 0,
         final_tool_result_max_chars: base_config.tool_result_max_chars,
         final_tool_use_input_max_chars: base_config.tool_use_input_max_chars,
+        final_message_content_max_chars: 0,
     };
 
     let mut adaptive_config = base_config.clone();
+    let max_content_chars = {
+        let mut max_chars = kiro_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+            .chars()
+            .count();
+        for msg in &kiro_request.conversation_state.history {
+            if let crate::kiro::model::requests::conversation::Message::User(u) = msg {
+                max_chars = max_chars.max(u.user_input_message.content.chars().count());
+            }
+        }
+        max_chars
+    };
+    let mut message_content_max_chars =
+        (max_content_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
 
     for _ in 0..ADAPTIVE_COMPRESSION_MAX_ITERS {
-        if request_body.len() <= max_body {
+        let loop_img_bytes = total_image_bytes(kiro_request);
+        if request_body.len().saturating_sub(loop_img_bytes) <= max_body {
             break;
         }
 
@@ -106,6 +148,17 @@ fn adaptive_shrink_request_body(
                 history.remove(ADAPTIVE_HISTORY_PRESERVE_MESSAGES);
                 outcome.additional_history_turns_removed += 1;
                 changed = true;
+            } else if message_content_max_chars >= ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS {
+                let saved = super::compressor::compress_long_messages_pass(
+                    &mut kiro_request.conversation_state,
+                    message_content_max_chars,
+                );
+                if saved > 0 {
+                    changed = true;
+                }
+                outcome.final_message_content_max_chars = message_content_max_chars;
+                message_content_max_chars =
+                    (message_content_max_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
             }
         }
 
@@ -406,7 +459,9 @@ pub async fn post_messages(
     };
 
     let max_body = state.compression_config.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
+    let img_bytes = total_image_bytes(&kiro_request);
+    let effective_body_len = request_body.len().saturating_sub(img_bytes);
+    if max_body > 0 && effective_body_len > max_body && state.compression_config.enabled {
         match adaptive_shrink_request_body(
             &mut kiro_request,
             &state.compression_config,
@@ -422,6 +477,7 @@ pub async fn post_messages(
                     additional_history_turns_removed = outcome.additional_history_turns_removed,
                     final_tool_result_max_chars = outcome.final_tool_result_max_chars,
                     final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
+                    final_message_content_max_chars = outcome.final_message_content_max_chars,
                     "applied adaptive request shrinking before upstream call"
                 );
             }
@@ -439,14 +495,18 @@ pub async fn post_messages(
         }
     }
 
-    if max_body > 0 && request_body.len() > max_body {
+    let final_img_bytes = total_image_bytes(&kiro_request);
+    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
+    if max_body > 0 && final_effective_len > max_body {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "Request too large ({} bytes, limit {}). Reduce conversation history or tool output.",
+                    "Request too large ({} bytes, {} image bytes excluded, {} effective, limit {}). Reduce conversation history or tool output.",
                     request_body.len(),
+                    final_img_bytes,
+                    final_effective_len,
                     max_body
                 ),
             )),
@@ -972,7 +1032,9 @@ pub async fn post_messages_cc(
     };
 
     let max_body = state.compression_config.max_request_body_bytes;
-    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
+    let img_bytes = total_image_bytes(&kiro_request);
+    let effective_body_len = request_body.len().saturating_sub(img_bytes);
+    if max_body > 0 && effective_body_len > max_body && state.compression_config.enabled {
         match adaptive_shrink_request_body(
             &mut kiro_request,
             &state.compression_config,
@@ -988,6 +1050,7 @@ pub async fn post_messages_cc(
                     additional_history_turns_removed = outcome.additional_history_turns_removed,
                     final_tool_result_max_chars = outcome.final_tool_result_max_chars,
                     final_tool_use_input_max_chars = outcome.final_tool_use_input_max_chars,
+                    final_message_content_max_chars = outcome.final_message_content_max_chars,
                     "applied adaptive request shrinking before upstream call"
                 );
             }
@@ -1005,14 +1068,18 @@ pub async fn post_messages_cc(
         }
     }
 
-    if max_body > 0 && request_body.len() > max_body {
+    let final_img_bytes = total_image_bytes(&kiro_request);
+    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
+    if max_body > 0 && final_effective_len > max_body {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "Request too large ({} bytes, limit {}). Reduce conversation history or tool output.",
+                    "Request too large ({} bytes, {} image bytes excluded, {} effective, limit {}). Reduce conversation history or tool output.",
                     request_body.len(),
+                    final_img_bytes,
+                    final_effective_len,
                     max_body
                 ),
             )),
