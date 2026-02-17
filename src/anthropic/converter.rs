@@ -4,7 +4,7 @@
 
 use uuid::Uuid;
 
-use crate::image::process_image;
+use crate::image::{process_gif_frames, process_image, process_image_to_format};
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
@@ -383,26 +383,92 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    match process_image(
-                                        &source.data,
-                                        &format,
-                                        compression_config,
-                                        total_image_count,
-                                    ) {
-                                        Ok(result) => {
-                                            if result.was_resized {
+                                    if format.eq_ignore_ascii_case("gif") {
+                                        match process_gif_frames(
+                                            &source.data,
+                                            compression_config,
+                                            total_image_count,
+                                        ) {
+                                            Ok(gif) => {
+                                                let total_final_bytes: usize =
+                                                    gif.frames.iter().map(|f| f.final_bytes_len).sum();
                                                 tracing::info!(
-                                                    original_size = ?result.original_size,
-                                                    final_size = ?result.final_size,
-                                                    tokens = result.tokens,
-                                                    "processed image payload"
+                                                    duration_ms = gif.duration_ms,
+                                                    source_frames = gif.source_frames,
+                                                    sampled_frames = gif.frames.len(),
+                                                    sampling_interval_ms = gif.sampling_interval_ms,
+                                                    output_format = gif.output_format,
+                                                    total_final_bytes,
+                                                    "processed gif payload into sampled frames"
                                                 );
+
+                                                for frame in gif.frames {
+                                                    images.push(KiroImage::from_base64(
+                                                        gif.output_format,
+                                                        frame.data,
+                                                    ));
+                                                }
                                             }
-                                            images.push(KiroImage::from_base64(format, result.data));
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, "gif frame sampling failed, falling back to static jpeg");
+                                                match process_image_to_format(
+                                                    &source.data,
+                                                    "jpeg",
+                                                    compression_config,
+                                                    total_image_count,
+                                                ) {
+                                                    Ok(result) => images.push(
+                                                        KiroImage::from_base64("jpeg", result.data),
+                                                    ),
+                                                    Err(fallback_err) => {
+                                                        tracing::warn!(error = %fallback_err, "gif re-encode fallback failed, using generic image processing");
+                                                        match process_image(
+                                                            &source.data,
+                                                            &format,
+                                                            compression_config,
+                                                            total_image_count,
+                                                        ) {
+                                                            Ok(result) => images.push(
+                                                                KiroImage::from_base64(
+                                                                    format,
+                                                                    result.data,
+                                                                ),
+                                                            ),
+                                                            Err(final_err) => {
+                                                                tracing::warn!(error = %final_err, "image processing failed, using original image payload");
+                                                                images.push(KiroImage::from_base64(
+                                                                    format,
+                                                                    source.data,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                        Err(err) => {
-                                            tracing::warn!(error = %err, "failed to process image payload, using original data");
-                                            images.push(KiroImage::from_base64(format, source.data));
+                                    } else {
+                                        match process_image(
+                                            &source.data,
+                                            &format,
+                                            compression_config,
+                                            total_image_count,
+                                        ) {
+                                            Ok(result) => {
+                                                if result.was_resized || result.was_reencoded {
+                                                    tracing::info!(
+                                                        original_size = ?result.original_size,
+                                                        final_size = ?result.final_size,
+                                                        tokens = result.tokens,
+                                                        final_bytes_len = result.final_bytes_len,
+                                                        "processed image payload"
+                                                    );
+                                                }
+                                                images.push(KiroImage::from_base64(format, result.data));
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, "failed to process image payload, using original data");
+                                                images.push(KiroImage::from_base64(format, source.data));
+                                            }
                                         }
                                     }
                                 }
