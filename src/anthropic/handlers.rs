@@ -39,13 +39,15 @@ use crate::anthropic::cache;
 
 fn is_input_too_long_error(err: &Error) -> bool {
     let s = err.to_string();
-    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
-        || s.contains("Input is too long")
-        || s.contains("Improperly formed request")
+    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || s.contains("Input is too long")
 }
 
 fn is_quota_exhausted_error(err: &Error) -> bool {
     err.to_string().contains("所有凭据已用尽")
+}
+
+fn is_improperly_formed_request_error(err: &Error) -> bool {
+    err.to_string().contains("Improperly formed request")
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -195,10 +197,9 @@ fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+    if is_input_too_long_error(&err) && err.to_string().contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
@@ -210,8 +211,20 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    if is_improperly_formed_request_error(&err) {
+        tracing::warn!(error = %err, "upstream rejected request as improperly formed");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Improperly formed request. Check message content is not empty and request format is valid.",
+            )),
+        )
+            .into_response();
+    }
+
     // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
+    if is_input_too_long_error(&err) && err.to_string().contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
         return (
             StatusCode::BAD_REQUEST,

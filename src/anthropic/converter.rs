@@ -271,6 +271,9 @@ pub fn convert_request(
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) =
         process_message_content(&last_message.content, compression_config, total_image_count)?;
+    if text_content.trim().is_empty() && images.is_empty() && tool_results.is_empty() {
+        return Err(ConversionError::EmptyMessages);
+    }
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools, compression_config.tool_description_max_chars);

@@ -96,14 +96,14 @@ pub fn process_gif_frames(
     // 计算采样间隔：
     // - 优先按“每秒最多 N 张（N<=5）”控制（用户期望的直觉规则）
     // - 当 GIF 超长（duration_secs > max_frames）时，转为按 max_frames 均匀采样
-    let duration_secs_ceil = ((duration_ms + 999) / 1000).max(1) as usize;
+    let duration_secs_ceil = duration_ms.div_ceil(1000).max(1) as usize;
     let fps_by_total = GIF_MAX_OUTPUT_FRAMES / duration_secs_ceil; // integer fps-per-second cap
     let fps = fps_by_total.min(GIF_MAX_FPS);
     let sampling_interval_ms = if fps > 0 {
         (1000 / fps as u64).max(1000 / GIF_MAX_FPS as u64)
     } else {
         // duration_secs_ceil > GIF_MAX_OUTPUT_FRAMES：平均 < 1 fps，改为均匀抽取 max_frames 张
-        ((duration_ms + GIF_MAX_OUTPUT_FRAMES as u64 - 1) / GIF_MAX_OUTPUT_FRAMES as u64).max(1)
+        duration_ms.div_ceil(GIF_MAX_OUTPUT_FRAMES as u64).max(1)
     };
 
     // 根据图片数量选择像素限制（复用现有策略）
@@ -301,11 +301,27 @@ pub fn process_image(
 
     let needs_resize = target_w != original_size.0 || target_h != original_size.1;
 
-    // GIF 特殊处理：即使不需要缩放，也强制重新编码为静态帧。
-    // 原因：动图通常“像素不大但字节巨大”，直接透传 base64 会显著放大请求体，
-    // 进而触发上游 400 Improperly formed request。
-    let force_reencode = format.eq_ignore_ascii_case("gif");
-    let should_decode_and_encode = needs_resize || force_reencode;
+    // 判断是否需要重新编码：
+    // 1. GIF 特殊处理：即使不需要缩放，也强制重新编码为静态帧
+    //    原因：动图通常"像素不大但字节巨大"，直接透传 base64 会显著放大请求体
+    // 2. 文件过大：即使尺寸符合要求，如果文件大小超过阈值也需要重新编码降低质量
+    //    阈值：200KB（经验值，避免小图片被过度压缩，同时拦截高质量大图）
+    const MAX_IMAGE_BYTES: usize = 200_000; // 200KB
+    let force_reencode_gif = format.eq_ignore_ascii_case("gif");
+    let force_reencode_large = original_bytes_len > MAX_IMAGE_BYTES;
+
+    if force_reencode_large {
+        tracing::info!(
+            original_bytes = original_bytes_len,
+            threshold_bytes = MAX_IMAGE_BYTES,
+            width = original_size.0,
+            height = original_size.1,
+            format = format,
+            "图片文件过大，强制重新编码以降低质量"
+        );
+    }
+
+    let should_decode_and_encode = needs_resize || force_reencode_gif || force_reencode_large;
 
     // 仅在需要缩放或强制重编码时才全量解码图片
     let (output_data, final_size, final_bytes_len, was_reencoded) = if should_decode_and_encode {
@@ -317,7 +333,21 @@ pub fn process_image(
         };
         let size = (processed.width(), processed.height());
         let (data, bytes_len) = encode_image(&processed, format)?;
-        (data, size, bytes_len, force_reencode && !needs_resize)
+        let was_reencoded = (force_reencode_gif || force_reencode_large) && !needs_resize;
+
+        if force_reencode_large && !needs_resize {
+            tracing::info!(
+                original_bytes = original_bytes_len,
+                final_bytes = bytes_len,
+                compression_ratio = format!(
+                    "{:.1}%",
+                    (1.0 - bytes_len as f64 / original_bytes_len as f64) * 100.0
+                ),
+                "大文件重新编码完成"
+            );
+        }
+
+        (data, size, bytes_len, was_reencoded)
     } else {
         (base64_data.to_string(), original_size, original_bytes_len, false)
     };
