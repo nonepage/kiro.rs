@@ -318,7 +318,14 @@ pub fn convert_request(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = non_empty_content_or_space(text_content, !images.is_empty() || has_tool_results);
+    let mut content =
+        non_empty_content_or_space(text_content, !images.is_empty() || has_tool_results);
+    // tool_result 可能在配对校验阶段被过滤，导致当前消息最终变成空字符串。
+    // 上游会拒绝空 content（400 Improperly formed request），因此这里做最终兜底。
+    if content.trim().is_empty() {
+        tracing::warn!("currentMessage content 为空，已使用占位符修复");
+        content = ".".to_string();
+    }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1588,6 +1595,384 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_web_search_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试 web_search_tool_result 块被提取为纯文本（title、url、snippet、page_age）保留到历史
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "server_tool_use", "id": "srvtoolu_01ABC", "name": "web_search", "input": {"query": "rust async"}},
+                {
+                    "type": "web_search_tool_result",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "Async in Rust",
+                            "url": "https://rust-lang.org/async",
+                            "encrypted_content": "Rust async/await guide.",
+                            "page_age": "January 1, 2025"
+                        },
+                        {"type": "web_search_result", "title": "", "url": "https://example.com/no-title",
+                         "encrypted_content": "", "page_age": null}
+                    ]
+                }
+            ]),
+        };
+
+        let result = convert_assistant_message(&msg).expect("应该成功转换");
+        let content = &result.assistant_response_message.content;
+
+        assert!(
+            content.contains("Async in Rust: https://rust-lang.org/async"),
+            "有 title 时应输出 'title: url'"
+        );
+        assert!(content.contains("Date: January 1, 2025"), "page_age 应保留");
+        assert!(
+            content.contains("Rust async/await guide."),
+            "snippet 应保留"
+        );
+        assert!(
+            content.contains("https://example.com/no-title"),
+            "title 为空时应输出纯 URL"
+        );
+        assert!(
+            !content.contains("srvtoolu_01ABC"),
+            "server_tool_use 应被忽略"
+        );
+    }
+
+    #[test]
+    fn test_convert_assistant_message_web_search_result_control_chars() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试 title 含控制字符时被过滤
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "web_search_tool_result",
+                    "content": [
+                        {"type": "web_search_result", "title": "Title\nWith\tControl", "url": "https://example.com"}
+                    ]
+                }
+            ]),
+        };
+
+        let result = convert_assistant_message(&msg).expect("应该成功转换");
+        let content = &result.assistant_response_message.content;
+
+        // 控制字符被过滤，不应出现换行和 tab
+        assert!(!content.contains('\t'), "tab 字符应被过滤");
+        // 内容应包含 URL
+        assert!(content.contains("https://example.com"), "URL 应保留");
+    }
+
+    #[test]
+    fn test_convert_tools_filters_web_search() {
+        use super::super::types::Tool as AnthropicTool;
+        use std::collections::HashMap;
+
+        // 测试 web_search 工具被过滤
+        // Kiro API 当前不支持 web_search，需要自动过滤
+        let tools = vec![
+            // web_search 工具（应被过滤）
+            AnthropicTool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: HashMap::new(),
+                max_uses: Some(8),
+            },
+            // 普通工具（应保留）
+            AnthropicTool {
+                tool_type: None,
+                name: "read_file".to_string(),
+                description: "Read a file from disk".to_string(),
+                input_schema: {
+                    let mut schema = HashMap::new();
+                    schema.insert("type".to_string(), serde_json::json!("object"));
+                    schema
+                },
+                max_uses: None,
+            },
+        ];
+
+        let converted = convert_tools(&Some(tools), 4000);
+
+        // 应该只有 1 个工具（web_search 被过滤）
+        assert_eq!(converted.len(), 1, "web_search 应该被过滤");
+        assert_eq!(
+            converted[0].tool_specification.name, "read_file",
+            "只应保留 read_file 工具"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_filters_all_web_search_variants() {
+        use super::super::types::Tool as AnthropicTool;
+        use std::collections::HashMap;
+
+        // 测试所有 web_search 变体都被过滤
+        let tools = vec![
+            AnthropicTool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: HashMap::new(),
+                max_uses: Some(8),
+            },
+            AnthropicTool {
+                tool_type: Some("web_search_20260101".to_string()), // 假设的未来版本
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: HashMap::new(),
+                max_uses: Some(10),
+            },
+        ];
+
+        let converted = convert_tools(&Some(tools), 4000);
+
+        // 所有 web_search 工具都应被过滤
+        assert!(converted.is_empty(), "所有 web_search 变体都应被过滤");
+    }
+
+    #[test]
+    fn test_convert_tools_fills_empty_description_and_normalizes_schema() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+        use std::collections::HashMap;
+
+        let mut input_schema = HashMap::new();
+        input_schema.insert("type".to_string(), serde_json::json!("object"));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "mcp__ida-pro-mcp__patch_address_assembles".to_string(),
+                description: "".to_string(), // 上游可能拒绝空 description
+                input_schema,                // 故意不带 $schema 等字段
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        let tool = tools
+            .iter()
+            .find(|t| t.tool_specification.name == "mcp__ida-pro-mcp__patch_address_assembles")
+            .expect("转换后应包含该工具");
+
+        assert!(
+            !tool.tool_specification.description.trim().is_empty(),
+            "转换后的工具描述不应为空"
+        );
+        assert_eq!(
+            tool.tool_specification.input_schema.json["$schema"],
+            "http://json-schema.org/draft-07/schema#"
+        );
+        assert_eq!(tool.tool_specification.input_schema.json["type"], "object");
+    }
+
+    #[test]
+    fn test_current_message_content_is_non_empty_when_only_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 构造典型 tool_use -> tool_result 链路，最后一条为 tool_result user 消息
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do it"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/tmp/a"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let content = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+
+        assert!(
+            !content.is_empty(),
+            "仅 tool_result 的 user 消息应使用占位符避免空 content"
+        );
+        assert_eq!(content, ".");
+    }
+
+    #[test]
+    fn test_history_user_message_content_is_non_empty_when_only_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 让 tool_result 进入 history：tool_result 后紧跟 assistant，然后用户继续提问
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do it"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/tmp/a"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("done"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("next"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+
+        let mut found = false;
+        for msg in &result.conversation_state.history {
+            let Message::User(user_msg) = msg else {
+                continue;
+            };
+            let ctx = &user_msg.user_input_message.user_input_message_context;
+            if ctx.tool_results.is_empty() {
+                continue;
+            }
+            found = true;
+            assert!(
+                !user_msg.user_input_message.content.is_empty(),
+                "history 中的 tool_result user 消息也需要占位符"
+            );
+            assert_eq!(user_msg.user_input_message.content, ".");
+        }
+        assert!(found, "测试数据应在 history 中包含 tool_results");
+    }
+
+    #[test]
+    fn test_current_message_content_is_non_empty_when_tool_result_filtered_as_orphan() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+        use std::collections::HashMap;
+
+        // 场景：当前消息仅有 tool_result，但 tool_use_id 与历史不匹配（会被过滤为孤立结果）
+        // 过滤后当前消息无文本/无 tool_result，必须仍保留非空 content 占位符，避免上游 400。
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("请读取配置"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tooluse_valid_1", "name": "read_file", "input": {"path": "/tmp/a"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_orphan_1", "content": "ok"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+
+        // 孤立 tool_result 会被过滤
+        assert!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .is_empty(),
+            "孤立 tool_result 应被过滤"
+        );
+
+        // 过滤后 content 仍应为非空占位符，避免上游拒绝请求
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "."
+        );
     }
 
     #[test]
