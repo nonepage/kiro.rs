@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::anthropic::cache::CacheResult;
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -404,6 +405,8 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_creation_input_tokens: i32,
+        cache_read_input_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -434,7 +437,9 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens
                     }
                 }),
             ));
@@ -484,6 +489,8 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 缓存结果
+    pub cache_result: CacheResult,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -510,6 +517,32 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
+            cache_result: CacheResult::default(),
+            strip_thinking_leading_newline: false,
+        }
+    }
+
+    /// 创建带缓存结果的StreamContext
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        cache_result: CacheResult,
+        thinking_enabled: bool,
+    ) -> Self {
+        Self {
+            state_manager: SseStateManager::new(),
+            model: model.into(),
+            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            input_tokens: cache_result.uncached_input_tokens,
+            context_input_tokens: None,
+            output_tokens: 0,
+            tool_block_indices: HashMap::new(),
+            thinking_enabled,
+            thinking_buffer: String::new(),
+            in_thinking_block: false,
+            thinking_extracted: false,
+            thinking_block_index: None,
+            text_block_index: None,
+            cache_result,
             strip_thinking_leading_newline: false,
         }
     }
@@ -528,7 +561,9 @@ impl StreamContext {
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": self.cache_result.cache_creation_input_tokens,
+                    "cache_read_input_tokens": self.cache_result.cache_read_input_tokens
                 }
             }
         })
@@ -1057,10 +1092,12 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(
+            final_input_tokens,
+            self.output_tokens,
+            self.cache_result.cache_creation_input_tokens,
+            self.cache_result.cache_read_input_tokens,
+        ));
         events
     }
 }
@@ -1099,6 +1136,22 @@ impl BufferedStreamContext {
             inner,
             event_buffer: Vec::new(),
             estimated_input_tokens,
+            initial_events_generated: false,
+        }
+    }
+
+    /// 创建带缓存结果的缓冲流上下文
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        cache_result: CacheResult,
+        thinking_enabled: bool,
+    ) -> Self {
+        let estimated = cache_result.uncached_input_tokens;
+        let inner = StreamContext::new_with_cache(model, cache_result, thinking_enabled);
+        Self {
+            inner,
+            event_buffer: Vec::new(),
+            estimated_input_tokens: estimated,
             initial_events_generated: false,
         }
     }
