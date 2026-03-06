@@ -92,6 +92,22 @@ fn compute_uncached_input_tokens(
     (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
 }
 
+fn resolve_usage_input_tokens(
+    fallback_total_input_tokens: i32,
+    context_total_input_tokens: Option<i32>,
+    cache_result: &cache::CacheResult,
+) -> i32 {
+    if cache_result.cache_creation_input_tokens > 0 || cache_result.cache_read_input_tokens > 0 {
+        return cache_result.uncached_input_tokens;
+    }
+
+    compute_uncached_input_tokens(
+        context_total_input_tokens.unwrap_or(fallback_total_input_tokens),
+        cache_result.cache_creation_input_tokens,
+        cache_result.cache_read_input_tokens,
+    )
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -629,12 +645,7 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
-    let final_total_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-    let final_input_tokens = compute_uncached_input_tokens(
-        final_total_input_tokens,
-        cache_result.cache_creation_input_tokens,
-        cache_result.cache_read_input_tokens,
-    );
+    let final_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens, &cache_result);
 
     // 构建 Anthropic 响应
     let response_body = json!({

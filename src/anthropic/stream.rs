@@ -18,6 +18,22 @@ fn compute_uncached_input_tokens(
     (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
 }
 
+fn resolve_usage_input_tokens(
+    fallback_total_input_tokens: i32,
+    context_total_input_tokens: Option<i32>,
+    cache_result: &CacheResult,
+) -> i32 {
+    if cache_result.cache_creation_input_tokens > 0 || cache_result.cache_read_input_tokens > 0 {
+        return cache_result.uncached_input_tokens;
+    }
+
+    compute_uncached_input_tokens(
+        context_total_input_tokens.unwrap_or(fallback_total_input_tokens),
+        cache_result.cache_creation_input_tokens,
+        cache_result.cache_read_input_tokens,
+    )
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -1097,11 +1113,10 @@ impl StreamContext {
         }
 
         // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
-        let final_total_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
-        let final_input_tokens = compute_uncached_input_tokens(
-            final_total_input_tokens,
-            self.cache_result.cache_creation_input_tokens,
-            self.cache_result.cache_read_input_tokens,
+        let final_input_tokens = resolve_usage_input_tokens(
+            self.input_tokens,
+            self.context_input_tokens,
+            &self.cache_result,
         );
 
         // 生成最终事件
@@ -1204,14 +1219,10 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // contextUsageEvent 给出的是总输入，回填 message_start 时需转换为未缓存部分
-        let final_total_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-        let final_input_tokens = compute_uncached_input_tokens(
-            final_total_input_tokens,
-            self.inner.cache_result.cache_creation_input_tokens,
-            self.inner.cache_result.cache_read_input_tokens,
+        let final_input_tokens = resolve_usage_input_tokens(
+            self.estimated_input_tokens,
+            self.inner.context_input_tokens,
+            &self.inner.cache_result,
         );
 
         // 更正 message_start 事件中的 input_tokens
