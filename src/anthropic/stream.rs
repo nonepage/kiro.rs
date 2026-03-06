@@ -10,6 +10,14 @@ use uuid::Uuid;
 use crate::anthropic::cache::CacheResult;
 use crate::kiro::model::events::Event;
 
+fn compute_uncached_input_tokens(
+    total_input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -1088,8 +1096,13 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
+        let final_total_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_input_tokens = compute_uncached_input_tokens(
+            final_total_input_tokens,
+            self.cache_result.cache_creation_input_tokens,
+            self.cache_result.cache_read_input_tokens,
+        );
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
@@ -1190,11 +1203,16 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
+        // contextUsageEvent 给出的是总输入，回填 message_start 时需转换为未缓存部分
+        let final_total_input_tokens = self
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
+        let final_input_tokens = compute_uncached_input_tokens(
+            final_total_input_tokens,
+            self.inner.cache_result.cache_creation_input_tokens,
+            self.inner.cache_result.cache_read_input_tokens,
+        );
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {

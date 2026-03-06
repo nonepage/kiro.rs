@@ -83,6 +83,15 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
+/// 计算 Anthropic usage 口径的 input_tokens（未缓存部分）
+fn compute_uncached_input_tokens(
+    total_input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -619,8 +628,13 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
+    let final_total_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let final_input_tokens = compute_uncached_input_tokens(
+        final_total_input_tokens,
+        cache_result.cache_creation_input_tokens,
+        cache_result.cache_read_input_tokens,
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
