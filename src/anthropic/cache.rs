@@ -18,6 +18,7 @@ static CACHE_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 const DEFAULT_TTL_SECS: u64 = 5 * 60;
 /// 1 小时 TTL
 const EXTENDED_TTL_SECS: u64 = 60 * 60;
+const IMPLICIT_BREAKPOINT_MIN_TOKENS: i32 = 1;
 
 /// 缓存断点信息
 #[derive(Debug, Clone)]
@@ -143,6 +144,32 @@ fn log_lookup_details(
     );
 }
 
+fn push_breakpoint(
+    breakpoints: &mut Vec<CacheBreakpoint>,
+    hasher: &Sha256,
+    cumulative_tokens: i32,
+    ttl: u64,
+) {
+    if cumulative_tokens < IMPLICIT_BREAKPOINT_MIN_TOKENS {
+        return;
+    }
+
+    let hash = format!("{:x}", hasher.clone().finalize());
+
+    if breakpoints
+        .last()
+        .is_some_and(|last| last.hash == hash || last.tokens == cumulative_tokens)
+    {
+        return;
+    }
+
+    breakpoints.push(CacheBreakpoint {
+        hash,
+        tokens: cumulative_tokens,
+        ttl,
+    });
+}
+
 /// 初始化 Redis 连接
 pub async fn init_redis(redis_url: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(redis_url)?;
@@ -210,12 +237,7 @@ pub fn compute_cache_breakpoints(
             cumulative_tokens += count_tool_tokens(tool);
 
             if let Some(cc) = &tool.cache_control {
-                let ttl = parse_ttl(cc);
-                breakpoints.push(CacheBreakpoint {
-                    hash: format!("{:x}", hasher.clone().finalize()),
-                    tokens: cumulative_tokens,
-                    ttl,
-                });
+                push_breakpoint(&mut breakpoints, &hasher, cumulative_tokens, parse_ttl(cc));
             }
         }
     }
@@ -227,20 +249,18 @@ pub fn compute_cache_breakpoints(
             cumulative_tokens += token::count_tokens(&msg.text) as i32;
 
             if let Some(cc) = &msg.cache_control {
-                let ttl = parse_ttl(cc);
-                breakpoints.push(CacheBreakpoint {
-                    hash: format!("{:x}", hasher.clone().finalize()),
-                    tokens: cumulative_tokens,
-                    ttl,
-                });
+                push_breakpoint(&mut breakpoints, &hasher, cumulative_tokens, parse_ttl(cc));
             }
         }
     }
 
     // 处理 messages（遍历所有消息内容块）
-    for msg in messages {
+    let last_message_index = messages.len().saturating_sub(1);
+    for (message_index, msg) in messages.iter().enumerate() {
         if let Some(blocks) = msg.content.as_array() {
-            for block in blocks {
+            let last_block_index = blocks.len().saturating_sub(1);
+
+            for (block_index, block) in blocks.iter().enumerate() {
                 let block_json = normalize_message_block(block);
                 hasher.update(block_json.as_bytes());
 
@@ -250,18 +270,40 @@ pub fn compute_cache_breakpoints(
 
                 if let Some(cc) = block.get("cache_control") {
                     if let Ok(cache_control) = serde_json::from_value::<CacheControl>(cc.clone()) {
-                        let ttl = parse_ttl(&cache_control);
-                        breakpoints.push(CacheBreakpoint {
-                            hash: format!("{:x}", hasher.clone().finalize()),
-                            tokens: cumulative_tokens,
-                            ttl,
-                        });
+                        let is_last_dynamic_block =
+                            message_index == last_message_index && block_index == last_block_index;
+                        if !is_last_dynamic_block {
+                            push_breakpoint(
+                                &mut breakpoints,
+                                &hasher,
+                                cumulative_tokens,
+                                parse_ttl(&cache_control),
+                            );
+                        }
                     }
                 }
+            }
+
+            if message_index != last_message_index {
+                push_breakpoint(
+                    &mut breakpoints,
+                    &hasher,
+                    cumulative_tokens,
+                    DEFAULT_TTL_SECS,
+                );
             }
         } else if let Some(text) = msg.content.as_str() {
             hasher.update(text.as_bytes());
             cumulative_tokens += token::count_tokens(text) as i32;
+
+            if message_index != last_message_index {
+                push_breakpoint(
+                    &mut breakpoints,
+                    &hasher,
+                    cumulative_tokens,
+                    DEFAULT_TTL_SECS,
+                );
+            }
         }
     }
 
