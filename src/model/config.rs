@@ -90,6 +90,10 @@ pub struct Config {
     #[serde(default)]
     pub redis_url: Option<String>,
 
+    /// 是否输出缓存断点与命中详情日志（可选）
+    #[serde(default)]
+    pub cache_debug_logging: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -158,6 +162,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             redis_url: None,
+            cache_debug_logging: false,
             load_balancing_mode: default_load_balancing_mode(),
             config_path: None,
         }

@@ -5,12 +5,14 @@ use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::anthropic::types::{CacheControl, Message, SystemMessage, Tool};
 use crate::token;
 
 /// 全局 Redis 连接管理器
 static REDIS_CONN: OnceLock<ConnectionManager> = OnceLock::new();
+static CACHE_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 
 /// 默认 TTL: 5 分钟
 const DEFAULT_TTL_SECS: u64 = 5 * 60;
@@ -37,6 +39,108 @@ pub struct CacheResult {
 enum CacheMutation {
     Refresh { index: usize },
     Create { index: usize },
+}
+
+pub fn set_debug_logging(enabled: bool) {
+    CACHE_DEBUG_LOGGING.store(enabled, Ordering::Relaxed);
+    if enabled {
+        tracing::info!("Cache debug logging enabled");
+    }
+}
+
+fn cache_debug_logging_enabled() -> bool {
+    CACHE_DEBUG_LOGGING.load(Ordering::Relaxed)
+}
+
+fn short_hash(hash: &str) -> &str {
+    let end = hash.len().min(12);
+    &hash[..end]
+}
+
+fn log_breakpoints(breakpoints: &[CacheBreakpoint], total_input_tokens: Option<i32>) {
+    if !cache_debug_logging_enabled() {
+        return;
+    }
+
+    let summary = breakpoints
+        .iter()
+        .enumerate()
+        .map(|(index, bp)| {
+            format!(
+                "#{}:{}t:{}s:{}",
+                index + 1,
+                bp.tokens,
+                bp.ttl,
+                short_hash(&bp.hash)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    match total_input_tokens {
+        Some(total) => tracing::info!(
+            "Cache breakpoints: total_input_tokens={} count={} {}",
+            total,
+            breakpoints.len(),
+            summary
+        ),
+        None => tracing::info!("Cache breakpoints: count={} {}", breakpoints.len(), summary),
+    }
+}
+
+fn log_lookup_details(
+    total_input_tokens: i32,
+    breakpoints: &[CacheBreakpoint],
+    cached_tokens: &[Option<i32>],
+    mutations: &[CacheMutation],
+    result: &CacheResult,
+) {
+    if !cache_debug_logging_enabled() {
+        return;
+    }
+
+    let states = breakpoints
+        .iter()
+        .zip(cached_tokens.iter())
+        .enumerate()
+        .map(|(index, (bp, cached))| match cached {
+            Some(tokens) => format!(
+                "#{}:hit(stored={},bp={},ttl={},hash={})",
+                index + 1,
+                tokens,
+                bp.tokens,
+                bp.ttl,
+                short_hash(&bp.hash)
+            ),
+            None => format!(
+                "#{}:miss(bp={},ttl={},hash={})",
+                index + 1,
+                bp.tokens,
+                bp.ttl,
+                short_hash(&bp.hash)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let actions = mutations
+        .iter()
+        .map(|mutation| match mutation {
+            CacheMutation::Refresh { index } => format!("refresh#{}", index + 1),
+            CacheMutation::Create { index } => format!("create#{}", index + 1),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    tracing::info!(
+        "Cache lookup: total_input_tokens={} states=[{}] actions=[{}] result(read={}, create={}, uncached={})",
+        total_input_tokens,
+        states,
+        actions,
+        result.cache_read_input_tokens,
+        result.cache_creation_input_tokens,
+        result.uncached_input_tokens
+    );
 }
 
 /// 初始化 Redis 连接
@@ -168,6 +272,8 @@ pub fn compute_cache_breakpoints(
         system.as_ref().map(|s| s.len()).unwrap_or(0),
         messages.len()
     );
+
+    log_breakpoints(&breakpoints, None);
 
     breakpoints
 }
@@ -327,6 +433,12 @@ pub async fn lookup_or_create(
 ) -> CacheResult {
     let Some(conn) = REDIS_CONN.get() else {
         tracing::debug!("Cache lookup skipped: Redis not available");
+        if cache_debug_logging_enabled() {
+            tracing::info!(
+                "Cache lookup skipped: redis unavailable, total_input_tokens={}",
+                total_input_tokens
+            );
+        }
         return CacheResult {
             uncached_input_tokens: total_input_tokens,
             ..Default::default()
@@ -335,6 +447,12 @@ pub async fn lookup_or_create(
 
     if breakpoints.is_empty() {
         tracing::debug!("Cache lookup skipped: no breakpoints");
+        if cache_debug_logging_enabled() {
+            tracing::info!(
+                "Cache lookup skipped: no breakpoints, total_input_tokens={}",
+                total_input_tokens
+            );
+        }
         return CacheResult {
             uncached_input_tokens: total_input_tokens,
             ..Default::default()
@@ -367,6 +485,14 @@ pub async fn lookup_or_create(
     }
 
     let (result, mutations) = plan_cache_mutations(breakpoints, &cached_tokens, total_input_tokens);
+    log_breakpoints(breakpoints, Some(total_input_tokens));
+    log_lookup_details(
+        total_input_tokens,
+        breakpoints,
+        &cached_tokens,
+        &mutations,
+        &result,
+    );
 
     for mutation in mutations {
         match mutation {
