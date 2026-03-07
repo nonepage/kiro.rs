@@ -2,16 +2,16 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header, HeaderMap},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -24,7 +24,10 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 use crate::anthropic::cache;
 
@@ -319,11 +322,8 @@ pub async fn post_messages(
 
     // 计算缓存断点并查询 Redis
     let cache_result = if cache::is_redis_available() {
-        let breakpoints = cache::compute_cache_breakpoints(
-            &payload.tools,
-            &payload.system,
-            &payload.messages,
-        );
+        let breakpoints =
+            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
         cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
     } else {
         cache::CacheResult {
@@ -573,14 +573,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 tool_uses.push(json!({
@@ -645,7 +645,8 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
-    let final_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens, &cache_result);
+    let final_input_tokens =
+        resolve_usage_input_tokens(input_tokens, context_input_tokens, &cache_result);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -678,14 +679,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -697,7 +694,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -838,11 +835,8 @@ pub async fn post_messages_cc(
 
     // 计算缓存断点并查询 Redis
     let cache_result = if cache::is_redis_available() {
-        let breakpoints = cache::compute_cache_breakpoints(
-            &payload.tools,
-            &payload.system,
-            &payload.messages,
-        );
+        let breakpoints =
+            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
         cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
     } else {
         cache::CacheResult {

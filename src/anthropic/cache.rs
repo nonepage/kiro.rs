@@ -33,6 +33,12 @@ pub struct CacheResult {
     pub uncached_input_tokens: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CacheMutation {
+    Refresh { index: usize },
+    Create { index: usize },
+}
+
 /// 初始化 Redis 连接
 pub async fn init_redis(redis_url: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(redis_url)?;
@@ -97,7 +103,7 @@ pub fn compute_cache_breakpoints(
         for tool in sorted_tools {
             let normalized = normalize_tool(tool);
             hasher.update(normalized.as_bytes());
-            cumulative_tokens += token::count_tokens(&normalized) as i32;
+            cumulative_tokens += count_tool_tokens(tool);
 
             if let Some(cc) = &tool.cache_control {
                 let ttl = parse_ttl(cc);
@@ -131,7 +137,7 @@ pub fn compute_cache_breakpoints(
     for msg in messages {
         if let Some(blocks) = msg.content.as_array() {
             for block in blocks {
-                let block_json = serde_json::to_string(block).unwrap_or_default();
+                let block_json = normalize_message_block(block);
                 hasher.update(block_json.as_bytes());
 
                 if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
@@ -209,6 +215,110 @@ fn normalize_tool(tool: &Tool) -> String {
     parts.join("|")
 }
 
+fn count_tool_tokens(tool: &Tool) -> i32 {
+    let mut total = 0;
+
+    if !tool.name.is_empty() {
+        total += token::count_tokens(&tool.name) as i32;
+    }
+    if !tool.description.is_empty() {
+        total += token::count_tokens(&tool.description) as i32;
+    }
+    if !tool.input_schema.is_empty() {
+        let schema_value = serde_json::to_value(&tool.input_schema).unwrap_or_default();
+        let schema = sort_json_keys(&schema_value).unwrap_or_default();
+        total += token::count_tokens(&schema) as i32;
+    }
+
+    total
+}
+
+fn normalize_message_block(block: &serde_json::Value) -> String {
+    let normalized = strip_cache_control(block);
+    sort_json_keys(&normalized).unwrap_or_else(|_| normalized.to_string())
+}
+
+fn strip_cache_control(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut normalized = serde_json::Map::new();
+            for (key, child) in map {
+                if key != "cache_control" {
+                    normalized.insert(key.clone(), strip_cache_control(child));
+                }
+            }
+            serde_json::Value::Object(normalized)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(strip_cache_control).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn plan_cache_mutations(
+    breakpoints: &[CacheBreakpoint],
+    cached_tokens: &[Option<i32>],
+    total_input_tokens: i32,
+) -> (CacheResult, Vec<CacheMutation>) {
+    debug_assert_eq!(breakpoints.len(), cached_tokens.len());
+
+    if breakpoints.is_empty() {
+        return (
+            CacheResult {
+                uncached_input_tokens: total_input_tokens,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+    }
+
+    let mut result = CacheResult::default();
+    let mut mutations = Vec::new();
+
+    if let Some((hit_index, stored_tokens)) = cached_tokens
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, tokens)| tokens.map(|tokens| (index, tokens)))
+    {
+        let hit_tokens = stored_tokens.clamp(0, breakpoints[hit_index].tokens);
+        result.cache_read_input_tokens = hit_tokens;
+        mutations.push(CacheMutation::Refresh { index: hit_index });
+
+        let mut covered_tokens = hit_tokens;
+        for index in (hit_index + 1)..breakpoints.len() {
+            let bp_tokens = breakpoints[index].tokens;
+
+            match cached_tokens[index] {
+                Some(existing_tokens) => {
+                    mutations.push(CacheMutation::Refresh { index });
+                    covered_tokens = covered_tokens.max(existing_tokens.clamp(0, bp_tokens));
+                }
+                None => {
+                    let additional_tokens = (bp_tokens - covered_tokens).max(0);
+                    result.cache_creation_input_tokens += additional_tokens;
+                    covered_tokens = bp_tokens;
+                    mutations.push(CacheMutation::Create { index });
+                }
+            }
+        }
+    } else {
+        let mut covered_tokens = 0;
+        for (index, bp) in breakpoints.iter().enumerate() {
+            let additional_tokens = (bp.tokens - covered_tokens).max(0);
+            result.cache_creation_input_tokens += additional_tokens;
+            covered_tokens = bp.tokens;
+            mutations.push(CacheMutation::Create { index });
+        }
+    }
+
+    let cached_total = result.cache_read_input_tokens + result.cache_creation_input_tokens;
+    result.uncached_input_tokens = (total_input_tokens - cached_total).max(0);
+
+    (result, mutations)
+}
+
 /// 查询或创建缓存
 pub async fn lookup_or_create(
     api_key: &str,
@@ -232,61 +342,60 @@ pub async fn lookup_or_create(
     }
 
     let mut conn = conn.clone();
-    let mut result = CacheResult::default();
+    let keys: Vec<String> = breakpoints
+        .iter()
+        .map(|bp| format!("cache:{}:{}", api_key, bp.hash))
+        .collect();
 
-    // 从最后一个断点向前查找缓存命中
-    for (i, bp) in breakpoints.iter().enumerate().rev() {
-        let key = format!("cache:{}:{}", api_key, bp.hash);
-
-        let cached: Option<i32> = conn.get(&key).await.ok().flatten();
-
-        if let Some(cached_tokens) = cached {
-            tracing::debug!("Cache hit: key={}, cached_tokens={}", key, cached_tokens);
-            result.cache_read_input_tokens = cached_tokens;
-
-            if let Err(e) = conn.expire::<_, ()>(&key, bp.ttl as i64).await {
-                tracing::warn!("Failed to refresh cache TTL for key {}: {}", key, e);
+    let mut cached_tokens = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let cached: Option<i32> = match conn.get(key).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("Failed to query cache key {}: {}", key, error);
+                None
             }
+        };
 
-            let mut prev_tokens = cached_tokens;
-            for later_bp in breakpoints.iter().skip(i + 1) {
-                let later_key = format!("cache:{}:{}", api_key, later_bp.hash);
-                let additional_tokens = later_bp.tokens - prev_tokens;
-
-                if let Err(e) = conn
-                    .set_ex::<_, _, ()>(&later_key, later_bp.tokens, later_bp.ttl)
-                    .await
-                {
-                    tracing::warn!("Failed to create cache for key {}: {}", later_key, e);
-                }
-
-                result.cache_creation_input_tokens += additional_tokens;
-                prev_tokens = later_bp.tokens;
-            }
-
-            break;
+        if let Some(tokens) = cached {
+            tracing::debug!("Cache hit: key={}, cached_tokens={}", key, tokens);
         } else {
             tracing::debug!("Cache miss: key={}", key);
         }
+
+        cached_tokens.push(cached);
     }
 
-    // 如果完全没有命中，创建所有断点的缓存
-    if result.cache_read_input_tokens == 0 && !breakpoints.is_empty() {
-        let mut prev_tokens = 0;
-        for bp in breakpoints {
-            let key = format!("cache:{}:{}", api_key, bp.hash);
-            if let Err(e) = conn.set_ex::<_, _, ()>(&key, bp.tokens, bp.ttl).await {
-                tracing::warn!("Failed to create cache for key {}: {}", key, e);
-            }
+    let (result, mutations) = plan_cache_mutations(breakpoints, &cached_tokens, total_input_tokens);
 
-            let additional_tokens = bp.tokens - prev_tokens;
-            result.cache_creation_input_tokens += additional_tokens;
-            prev_tokens = bp.tokens;
+    for mutation in mutations {
+        match mutation {
+            CacheMutation::Refresh { index } => {
+                if let Err(error) = conn
+                    .expire::<_, ()>(&keys[index], breakpoints[index].ttl as i64)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to refresh cache TTL for key {}: {}",
+                        keys[index],
+                        error
+                    );
+                }
+            }
+            CacheMutation::Create { index } => {
+                if let Err(error) = conn
+                    .set_ex::<_, _, ()>(
+                        &keys[index],
+                        breakpoints[index].tokens,
+                        breakpoints[index].ttl,
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to create cache for key {}: {}", keys[index], error);
+                }
+            }
         }
     }
-
-    let cached_tokens = result.cache_read_input_tokens + result.cache_creation_input_tokens;
-    result.uncached_input_tokens = (total_input_tokens - cached_tokens).max(0);
 
     tracing::debug!(
         "Cache result: read={}, creation={}, uncached={}",
