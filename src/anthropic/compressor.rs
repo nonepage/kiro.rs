@@ -91,6 +91,14 @@ pub fn compress(state: &mut ConversationState, config: &CompressionConfig) -> Co
         );
     }
 
+    let repaired_non_empty_contents = repair_non_empty_content_pass(state);
+    if repaired_non_empty_contents > 0 {
+        tracing::debug!(
+            repaired_non_empty_contents,
+            "压缩后已修复空 content 占位符"
+        );
+    }
+
     stats
 }
 
@@ -560,6 +568,46 @@ fn repair_tool_pairing_pass(state: &mut ConversationState) -> (usize, usize) {
     (removed_tool_uses, removed_tool_results)
 }
 
+/// 修复空 content 字段（压缩后最终兜底）。
+///
+/// 规则：若 content 为空或全空白，则统一替换为 "."。
+/// 处理范围：
+/// - history user_input_message.content
+/// - history assistant_response_message.content
+/// - current_message.user_input_message.content
+fn repair_non_empty_content_pass(state: &mut ConversationState) -> usize {
+    let mut repaired = 0usize;
+
+    for msg in &mut state.history {
+        match msg {
+            Message::User(user_msg) => {
+                if repair_content_field(&mut user_msg.user_input_message.content) {
+                    repaired += 1;
+                }
+            }
+            Message::Assistant(assistant_msg) => {
+                if repair_content_field(&mut assistant_msg.assistant_response_message.content) {
+                    repaired += 1;
+                }
+            }
+        }
+    }
+
+    if repair_content_field(&mut state.current_message.user_input_message.content) {
+        repaired += 1;
+    }
+
+    repaired
+}
+
+fn repair_content_field(field: &mut String) -> bool {
+    if field.trim().is_empty() {
+        *field = ".".to_string();
+        return true;
+    }
+    false
+}
+
 // ============ 超长消息内容截断 ============
 
 /// 截断超长的用户消息内容（history user messages 和 current_message）
@@ -753,6 +801,154 @@ mod tests {
                     .content
                     .contains("<thinking>keep me</thinking>")
             );
+        }
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_repairs_whitespace_history_user() {
+        let mut state = make_simple_state(vec![("   \n\n", "assistant")], "current");
+        let config = CompressionConfig {
+            whitespace_compression: true,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, ".");
+        } else {
+            panic!("expected User message");
+        }
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_repairs_whitespace_current() {
+        let mut state = make_simple_state(vec![("user", "assistant")], "   ");
+        let config = CompressionConfig {
+            whitespace_compression: true,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+        assert_eq!(state.current_message.user_input_message.content, ".");
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_repairs_thinking_discard() {
+        let mut state = make_simple_state(
+            vec![("hi", "<thinking>only thinking</thinking>   ")],
+            "next",
+        );
+        let config = CompressionConfig {
+            thinking_strategy: "discard".to_string(),
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::Assistant(a) = &state.history[1] {
+            assert_eq!(a.assistant_response_message.content, ".");
+        } else {
+            panic!("expected Assistant message");
+        }
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_repairs_after_tool_pairing() {
+        let tool_use_id = "tooluse_orphan";
+
+        let assistant_msg = Message::Assistant(HistoryAssistantMessage::new(" "));
+
+        let user_with_tool_result = Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new(" ", "claude-sonnet-4.5").with_context(
+                UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                    tool_use_id,
+                    "ok",
+                )]),
+            ),
+        });
+
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "next",
+                "claude-sonnet-4.5",
+            )))
+            .with_history(vec![assistant_msg, user_with_tool_result]);
+
+        let config = CompressionConfig {
+            max_history_turns: 0,
+            max_history_chars: 0,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::Assistant(a) = &state.history[0] {
+            assert_eq!(a.assistant_response_message.content, ".");
+        } else {
+            panic!("expected Assistant message");
+        }
+
+        if let Message::User(u) = &state.history[1] {
+            assert_eq!(u.user_input_message.content, ".");
+            assert!(u.user_input_message.user_input_message_context.tool_results.is_empty());
+        } else {
+            panic!("expected User message");
+        }
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_keeps_normal_content() {
+        let mut state = make_simple_state(vec![("user", "assistant")], "current");
+        let config = CompressionConfig {
+            whitespace_compression: true,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, "user");
+        }
+        if let Message::Assistant(a) = &state.history[1] {
+            assert_eq!(a.assistant_response_message.content, "assistant");
+        }
+        assert_eq!(state.current_message.user_input_message.content, "current");
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_placeholder_is_idempotent() {
+        let mut state = make_simple_state(vec![(".", ".")], ".");
+        let config = CompressionConfig {
+            whitespace_compression: true,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, ".");
+        }
+        if let Message::Assistant(a) = &state.history[1] {
+            assert_eq!(a.assistant_response_message.content, ".");
+        }
+        assert_eq!(state.current_message.user_input_message.content, ".");
+    }
+
+    #[test]
+    fn test_compress_non_empty_content_repairs_empty_history_assistant_after_whitespace() {
+        let mut state = make_simple_state(vec![("user", "\n\n   \n")], "current");
+        let config = CompressionConfig {
+            whitespace_compression: true,
+            ..Default::default()
+        };
+
+        let _stats = compress(&mut state, &config);
+
+        if let Message::Assistant(a) = &state.history[1] {
+            assert_eq!(a.assistant_response_message.content, ".");
+        } else {
+            panic!("expected Assistant message");
         }
     }
 
