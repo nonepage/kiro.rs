@@ -39,12 +39,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/balances/cached", get(get_cached_balances))
         .route("/credentials/import-token-json", post(import_token_json))
-        .route("/credentials/{id}", delete(delete_credential))
-        .route("/credentials/{id}/disabled", post(set_credential_disabled))
-        .route("/credentials/{id}/priority", post(set_credential_priority))
-        .route("/credentials/{id}/region", post(set_credential_region))
-        .route("/credentials/{id}/reset", post(reset_failure_count))
-        .route("/credentials/{id}/balance", get(get_credential_balance))
+        // Avoid shadowing collection routes like /credentials/import-token-json
+        // with the dynamic credential-id matcher.
+        .route("/credentials/id/{id}", delete(delete_credential))
+        .route(
+            "/credentials/id/{id}/disabled",
+            post(set_credential_disabled),
+        )
+        .route(
+            "/credentials/id/{id}/priority",
+            post(set_credential_priority),
+        )
+        .route("/credentials/id/{id}/region", post(set_credential_region))
+        .route("/credentials/id/{id}/reset", post(reset_failure_count))
+        .route("/credentials/id/{id}/balance", get(get_credential_balance))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

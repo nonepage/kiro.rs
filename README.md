@@ -443,11 +443,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 - **Admin API（认证同 API Key）**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
-  - `DELETE /api/admin/credentials/:id` - 删除凭据
-  - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
-  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
-  - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `POST /api/admin/credentials/import-token-json` - 批量导入 token.json
+  - `GET /api/admin/credentials/balances/cached` - 获取缓存余额
+  - `DELETE /api/admin/credentials/id/:id` - 删除凭据
+  - `POST /api/admin/credentials/id/:id/disabled` - 设置凭据禁用状态
+  - `POST /api/admin/credentials/id/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/id/:id/region` - 设置凭据 region / apiRegion
+  - `POST /api/admin/credentials/id/:id/reset` - 重置失败计数
+  - `GET /api/admin/credentials/id/:id/balance` - 获取凭据余额
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

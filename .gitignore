@@ -4,6 +4,7 @@
 /config.json
 /credentials.json
 /.idea
+/.claude
 /test.json
 /Cargo.lock
 /admin-ui/node_modules/

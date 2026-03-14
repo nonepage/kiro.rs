@@ -44,7 +44,7 @@ export async function setCredentialDisabled(
   disabled: boolean
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(
-    `/credentials/${id}/disabled`,
+    `/credentials/id/${id}/disabled`,
     { disabled } as SetDisabledRequest
   )
   return data
@@ -56,7 +56,7 @@ export async function setCredentialPriority(
   priority: number
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(
-    `/credentials/${id}/priority`,
+    `/credentials/id/${id}/priority`,
     { priority } as SetPriorityRequest
   )
   return data
@@ -66,7 +66,7 @@ export async function setCredentialPriority(
 export async function resetCredentialFailure(
   id: number
 ): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/reset`)
+  const { data } = await api.post<SuccessResponse>(`/credentials/id/${id}/reset`)
   return data
 }
 
@@ -76,7 +76,7 @@ export async function setCredentialRegion(
   region: string | null,
   apiRegion: string | null
 ): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/region`, {
+  const { data } = await api.post<SuccessResponse>(`/credentials/id/${id}/region`, {
     region: region || null,
     apiRegion: apiRegion || null,
   })
@@ -85,7 +85,7 @@ export async function setCredentialRegion(
 
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  const { data } = await api.get<BalanceResponse>(`/credentials/id/${id}/balance`)
   return data
 }
 
@@ -99,7 +99,7 @@ export async function getCachedBalances(): Promise<CachedBalancesResponse> {
 export async function getCredentialAccountInfo(
   id: number
 ): Promise<CredentialAccountInfoResponse> {
-  const { data } = await api.get<CredentialAccountInfoResponse>(`/credentials/${id}/account`)
+  const { data } = await api.get<CredentialAccountInfoResponse>(`/credentials/id/${id}/account`)
   return data
 }
 
@@ -113,19 +113,19 @@ export async function addCredential(
 
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
-  const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  const { data } = await api.delete<SuccessResponse>(`/credentials/id/${id}`)
   return data
 }
 
 // 获取指定凭据统计
 export async function getCredentialStats(id: number): Promise<CredentialStatsResponse> {
-  const { data } = await api.get<CredentialStatsResponse>(`/credentials/${id}/stats`)
+  const { data } = await api.get<CredentialStatsResponse>(`/credentials/id/${id}/stats`)
   return data
 }
 
 // 清空指定凭据统计
 export async function resetCredentialStats(id: number): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/stats/reset`)
+  const { data } = await api.post<SuccessResponse>(`/credentials/id/${id}/stats/reset`)
   return data
 }
 

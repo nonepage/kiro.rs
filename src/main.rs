@@ -163,10 +163,13 @@ async fn main() {
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
-        tracing::info!("  POST /api/admin/credentials/:index/disabled");
-        tracing::info!("  POST /api/admin/credentials/:index/priority");
-        tracing::info!("  POST /api/admin/credentials/:index/reset");
-        tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  POST /api/admin/credentials/import-token-json");
+        tracing::info!("  GET  /api/admin/credentials/balances/cached");
+        tracing::info!("  POST /api/admin/credentials/id/:id/disabled");
+        tracing::info!("  POST /api/admin/credentials/id/:id/priority");
+        tracing::info!("  POST /api/admin/credentials/id/:id/region");
+        tracing::info!("  POST /api/admin/credentials/id/:id/reset");
+        tracing::info!("  GET  /api/admin/credentials/id/:id/balance");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }
