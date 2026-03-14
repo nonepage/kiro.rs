@@ -154,6 +154,7 @@ where
             E: serde::de::Error,
         {
             Ok(Some(vec![SystemMessage {
+                message_type: None,
                 text: value.to_string(),
                 cache_control: None,
             }]))

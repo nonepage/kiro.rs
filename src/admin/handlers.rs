@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest, SetPriorityRequest,
+        SetRegionRequest, SuccessResponse,
     },
 };
 
@@ -54,6 +54,22 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/region
+/// 设置凭据 Region
+pub async fn set_credential_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRegionRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_region(id, payload.region, payload.api_region)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} Region 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -82,6 +98,12 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/balances/cached
+/// 获取所有凭据的缓存余额
+pub async fn get_cached_balances(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cached_balances())
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(
@@ -106,21 +128,12 @@ pub async fn delete_credential(
     }
 }
 
-/// GET /api/admin/config/load-balancing
-/// 获取负载均衡模式
-pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_load_balancing_mode();
-    Json(response)
-}
-
-/// PUT /api/admin/config/load-balancing
-/// 设置负载均衡模式
-pub async fn set_load_balancing_mode(
+/// POST /api/admin/credentials/import-token-json
+/// 批量导入 token.json
+pub async fn import_token_json(
     State(state): State<AdminState>,
-    Json(payload): Json<SetLoadBalancingModeRequest>,
+    Json(payload): Json<ImportTokenJsonRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_load_balancing_mode(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
+    let response = state.service.import_token_json(payload).await;
+    Json(response)
 }

@@ -119,9 +119,13 @@ export async function sha256Hex(value: string): Promise<string> {
 
   // 安全上下文中使用原生 Web Crypto API（性能更好）
   if (typeof crypto !== 'undefined' && crypto.subtle) {
-    const digest = await crypto.subtle.digest('SHA-256', encoded)
-    const bytes = new Uint8Array(digest)
-    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', encoded)
+      const bytes = new Uint8Array(digest)
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+    } catch {
+      // digest 可能在某些策略/上下文下抛错，回退到纯 JS 实现
+    }
   }
 
   // 非安全上下文 fallback：纯 JS SHA-256 实现

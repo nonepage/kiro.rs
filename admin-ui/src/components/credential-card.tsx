@@ -15,17 +15,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem, CachedBalanceInfo, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetRegion,
   useResetFailure,
   useDeleteCredential,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
-  onViewBalance: (id: number) => void
+  cachedBalance?: CachedBalanceInfo
+  onViewBalance: (id: number, forceRefresh: boolean) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -50,6 +52,7 @@ function formatLastUsed(lastUsedAt: string | null): string {
 
 export function CredentialCard({
   credential,
+  cachedBalance,
   onViewBalance,
   selected,
   onToggleSelect,
@@ -58,10 +61,14 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingRegion, setEditingRegion] = useState(false)
+  const [regionValue, setRegionValue] = useState(credential.region ?? '')
+  const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion ?? '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setRegion = useSetRegion()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
 
@@ -99,6 +106,25 @@ export function CredentialCard({
     )
   }
 
+  const handleRegionChange = () => {
+    setRegion.mutate(
+      {
+        id: credential.id,
+        region: regionValue.trim() || null,
+        apiRegion: apiRegionValue.trim() || null,
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRegion(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => {
@@ -128,9 +154,33 @@ export function CredentialCard({
     })
   }
 
+  // 格式化缓存时间（相对时间）
+  const formatCacheAge = (cachedAt: number) => {
+    const now = Date.now()
+    const diff = now - cachedAt
+    const seconds = Math.floor(diff / 1000)
+    if (seconds < 60) return `${seconds}秒前`
+    const minutes = Math.floor(seconds / 60)
+    if (minutes < 60) return `${minutes}分钟前`
+    return `${Math.floor(minutes / 60)}小时前`
+  }
+
+  // 检查缓存是否过期（使用后端返回的 TTL）
+  const isCacheStale = () => {
+    if (!cachedBalance) return true
+    const ageMs = Date.now() - cachedBalance.cachedAt
+    const ttlMs = (cachedBalance.ttlSecs ?? 60) * 1000
+    return ageMs > ttlMs
+  }
+
+  const handleViewBalance = () => {
+    onViewBalance(credential.id, isCacheStale())
+  }
+
+
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card>
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -140,9 +190,6 @@ export function CredentialCard({
               />
               <CardTitle className="text-lg flex items-center gap-2">
                 {credential.email || `凭据 #${credential.id}`}
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
@@ -242,12 +289,85 @@ export function CredentialCard({
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
+            <div>
+              <span className="text-muted-foreground">余额：</span>
+              {cachedBalance && cachedBalance.ttlSecs > 0 ? (
+                <>
+                  <span className={`font-medium ${cachedBalance.remaining > 0 ? 'text-green-600' : 'text-red-500'}`}>
+                    ${cachedBalance.remaining.toFixed(2)}
+                  </span>
+                  <span className="text-xs text-muted-foreground ml-1">
+                    ({formatCacheAge(cachedBalance.cachedAt)})
+                  </span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">—</span>
+              )}
+            </div>
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
+            {/* Region 配置 */}
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Region：</span>
+              {editingRegion ? (
+                <div className="inline-flex items-center gap-1 ml-1 flex-wrap">
+                  <Input
+                    placeholder="Region（留空清除）"
+                    value={regionValue}
+                    onChange={(e) => setRegionValue(e.target.value)}
+                    className="w-32 h-7 text-sm"
+                  />
+                  <Input
+                    placeholder="API Region（可选）"
+                    value={apiRegionValue}
+                    onChange={(e) => setApiRegionValue(e.target.value)}
+                    className="w-36 h-7 text-sm"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleRegionChange}
+                    disabled={setRegion.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingRegion(false)
+                      setRegionValue(credential.region ?? '')
+                      setApiRegionValue(credential.apiRegion ?? '')
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => {
+                    setRegionValue(credential.region ?? '')
+                    setApiRegionValue(credential.apiRegion ?? '')
+                    setEditingRegion(true)
+                  }}
+                >
+                  {credential.region || '全局默认'}
+                  {credential.apiRegion && (
+                    <span className="text-muted-foreground ml-1">
+                      / API: {credential.apiRegion}
+                    </span>
+                  )}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -305,7 +425,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="default"
-              onClick={() => onViewBalance(credential.id)}
+              onClick={handleViewBalance}
             >
               <Wallet className="h-4 w-4 mr-1" />
               查看余额

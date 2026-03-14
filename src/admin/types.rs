@@ -12,8 +12,6 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
-    pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -30,8 +28,6 @@ pub struct CredentialStatusItem {
     pub disabled: bool,
     /// 连续失败次数
     pub failure_count: u32,
-    /// 是否为当前活跃凭据
-    pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
     /// 认证方式
@@ -46,11 +42,10 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
-    /// 是否配置了凭据级代理
-    pub has_proxy: bool,
-    /// 代理 URL（用于前端展示）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_url: Option<String>,
+    /// 凭据级 Region（用于 Token 刷新）
+    pub region: Option<String>,
+    /// 凭据级 API Region（单独覆盖 API 请求）
+    pub api_region: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -69,6 +64,16 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改 Region 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRegionRequest {
+    /// 凭据级 Region（用于 Token 刷新），空字符串表示清除
+    pub region: Option<String>,
+    /// 凭据级 API Region（单独覆盖 API 请求），空字符串表示清除
+    pub api_region: Option<String>,
 }
 
 /// 添加凭据请求
@@ -92,14 +97,11 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub priority: u32,
 
-    /// 凭据级 Region 配置（用于 OIDC token 刷新）
+    /// 凭据级 Region 配置（用于 Token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
 
-    /// 凭据级 Auth Region（用于 Token 刷新）
-    pub auth_region: Option<String>,
-
-    /// 凭据级 API Region（用于 API 请求）
+    /// 凭据级 API Region（用于 API 调用）
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
@@ -109,13 +111,13 @@ pub struct AddCredentialRequest {
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
-    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    /// 凭据级代理 URL
     pub proxy_url: Option<String>,
 
-    /// 凭据级代理认证用户名（可选）
+    /// 凭据级代理用户名
     pub proxy_username: Option<String>,
 
-    /// 凭据级代理认证密码（可选）
+    /// 凭据级代理密码
     pub proxy_password: Option<String>,
 }
 
@@ -158,23 +160,29 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
-// ============ 负载均衡配置 ============
+/// 缓存余额信息
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalanceItem {
+    /// 凭据 ID
+    pub id: u64,
+    /// 缓存的剩余额度
+    pub remaining: f64,
+    /// 缓存时间（Unix 毫秒时间戳）
+    pub cached_at: u64,
+    /// 缓存存活时间（秒），缓存过期时间 = cached_at + ttl_secs * 1000
+    pub ttl_secs: u64,
+}
 
-/// 负载均衡模式响应
+/// 所有凭据的缓存余额响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
-    pub mode: String,
+pub struct CachedBalancesResponse {
+    /// 各凭据的缓存余额列表
+    pub balances: Vec<CachedBalanceItem>,
 }
 
-/// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
+// ============ 负载均衡配置 ============
 
 // ============ 通用响应 ============
 
@@ -192,6 +200,94 @@ impl SuccessResponse {
             message: message.into(),
         }
     }
+}
+
+// ============ 批量导入 token.json ============
+
+/// 官方 token.json 格式（用于解析导入）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenJsonItem {
+    pub provider: Option<String>,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub auth_method: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    pub region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+}
+
+/// 批量导入请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonRequest {
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+    pub items: ImportItems,
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+/// 导入项（支持单个或数组）
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ImportItems {
+    Single(TokenJsonItem),
+    Multiple(Vec<TokenJsonItem>),
+}
+
+impl ImportItems {
+    pub fn into_vec(self) -> Vec<TokenJsonItem> {
+        match self {
+            ImportItems::Single(item) => vec![item],
+            ImportItems::Multiple(items) => items,
+        }
+    }
+}
+
+/// 批量导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonResponse {
+    pub summary: ImportSummary,
+    pub items: Vec<ImportItemResult>,
+}
+
+/// 导入汇总
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub parsed: usize,
+    pub added: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+}
+
+/// 单项导入结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItemResult {
+    pub index: usize,
+    pub fingerprint: String,
+    pub action: ImportAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+}
+
+/// 导入动作
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportAction {
+    Added,
+    Skipped,
+    Invalid,
 }
 
 /// 错误响应

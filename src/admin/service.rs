@@ -8,13 +8,16 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::common::utf8::floor_char_boundary;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceItem,
+    CachedBalancesResponse, CredentialStatusItem, CredentialsStatusResponse, ImportAction,
+    ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
+    TokenJsonItem,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -65,7 +68,6 @@ impl AdminService {
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
@@ -73,8 +75,8 @@ impl AdminService {
                 email: entry.email,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
+                region: entry.region,
+                api_region: entry.api_region,
             })
             .collect();
 
@@ -84,32 +86,40 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
             credentials,
         }
     }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
         self.token_manager
             .set_disabled(id, disabled)
-            .map_err(|e| self.classify_error(e, id))?;
-
-        // 只有禁用的是当前凭据时才尝试切换到下一个
-        if disabled && id == current_id {
-            let _ = self.token_manager.switch_to_next();
-        }
-        Ok(())
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 设置凭据优先级
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据 Region
+    pub fn set_region(
+        &self,
+        id: u64,
+        region: Option<String>,
+        api_region: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        // trim 后空字符串转 None
+        let region = region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let api_region = api_region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.token_manager
+            .set_region(id, region, api_region)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -170,6 +180,9 @@ impl AdminService {
             0.0
         };
 
+        // 更新缓存，使列表页面能显示最新余额
+        self.token_manager.update_balance_cache(id, remaining);
+
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
@@ -179,6 +192,23 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 获取所有凭据的缓存余额
+    pub fn get_cached_balances(&self) -> CachedBalancesResponse {
+        let balances = self
+            .token_manager
+            .get_all_cached_balances()
+            .into_iter()
+            .map(|info| CachedBalanceItem {
+                id: info.id,
+                remaining: info.remaining,
+                cached_at: info.cached_at,
+                ttl_secs: info.ttl_secs,
+            })
+            .collect();
+
+        CachedBalancesResponse { balances }
     }
 
     /// 添加新凭据
@@ -199,11 +229,10 @@ impl AdminService {
             client_secret: req.client_secret,
             priority: req.priority,
             region: req.region,
-            auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
+            subscription_title: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -216,11 +245,6 @@ impl AdminService {
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
-
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
-        }
 
         Ok(AddCredentialResponse {
             success: true,
@@ -244,32 +268,6 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
-    }
-
-    /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
-        LoadBalancingModeResponse {
-            mode: self.token_manager.get_load_balancing_mode(),
-        }
-    }
-
-    /// 设置负载均衡模式
-    pub fn set_load_balancing_mode(
-        &self,
-        req: SetLoadBalancingModeRequest,
-    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
     // ============ 余额缓存持久化 ============
@@ -314,15 +312,28 @@ impl AdminService {
             None => return,
         };
 
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        // 快速 clone 数据后释放锁，减少锁持有时间
+        let map: HashMap<String, CachedBalance> = {
+            let cache = self.balance_cache.lock();
+            cache
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        };
 
+        // 锁外执行序列化和文件 IO
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
+                // 原子写入：先写临时文件，再重命名
+                let tmp_path = path.with_extension("json.tmp");
+                match std::fs::write(&tmp_path, json) {
+                    Ok(_) => {
+                        if let Err(e) = std::fs::rename(&tmp_path, path) {
+                            tracing::warn!("原子重命名余额缓存失败: {}", e);
+                            let _ = std::fs::remove_file(&tmp_path);
+                        }
+                    }
+                    Err(e) => tracing::warn!("写入临时余额文件失败: {}", e),
                 }
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
@@ -411,5 +422,191 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    /// 批量导入 token.json
+    ///
+    /// 解析官方 token.json 格式，按 provider 字段自动映射 authMethod：
+    /// - BuilderId/builder-id/idc → idc
+    /// - Social/social → social
+    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+        let items = req.items.into_vec();
+        let dry_run = req.dry_run;
+
+        let mut results = Vec::with_capacity(items.len());
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        let mut invalid = 0usize;
+
+        for (index, item) in items.into_iter().enumerate() {
+            let result = self.process_token_json_item(index, item, dry_run).await;
+            match result.action {
+                ImportAction::Added => added += 1,
+                ImportAction::Skipped => skipped += 1,
+                ImportAction::Invalid => invalid += 1,
+            }
+            results.push(result);
+        }
+
+        ImportTokenJsonResponse {
+            summary: ImportSummary {
+                parsed: results.len(),
+                added,
+                skipped,
+                invalid,
+            },
+            items: results,
+        }
+    }
+
+    /// 处理单个 token.json 项
+    async fn process_token_json_item(
+        &self,
+        index: usize,
+        item: TokenJsonItem,
+        dry_run: bool,
+    ) -> ImportItemResult {
+        // 生成指纹（用于识别和去重）
+        let fingerprint = Self::generate_fingerprint(&item);
+
+        // 验证必填字段
+        let refresh_token = match &item.refresh_token {
+            Some(rt) if !rt.is_empty() => rt.clone(),
+            _ => {
+                return ImportItemResult {
+                    index,
+                    fingerprint,
+                    action: ImportAction::Invalid,
+                    reason: Some("缺少 refreshToken".to_string()),
+                    credential_id: None,
+                };
+            }
+        };
+
+        // 映射 authMethod
+        let auth_method = Self::map_auth_method(&item);
+
+        // IdC 需要 clientId 和 clientSecret
+        if auth_method == "idc" && (item.client_id.is_none() || item.client_secret.is_none()) {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Invalid,
+                reason: Some(format!("{} 认证需要 clientId 和 clientSecret", auth_method)),
+                credential_id: None,
+            };
+        }
+
+        // 检查是否已存在（通过 refreshToken 前缀匹配）
+        if self.token_manager.has_refresh_token_prefix(&refresh_token) {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Skipped,
+                reason: Some("凭据已存在".to_string()),
+                credential_id: None,
+            };
+        }
+
+        // dry-run 模式只返回预览
+        if dry_run {
+            return ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Added,
+                reason: Some("预览模式".to_string()),
+                credential_id: None,
+            };
+        }
+
+        // 实际添加凭据（trim + 空字符串转 None，与 set_region 逻辑一致）
+        let region = item
+            .region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let api_region = item
+            .api_region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let new_cred = KiroCredentials {
+            id: None,
+            access_token: None,
+            refresh_token: Some(refresh_token),
+            profile_arn: None,
+            expires_at: None,
+            auth_method: Some(auth_method),
+            client_id: item.client_id,
+            client_secret: item.client_secret,
+            priority: item.priority,
+            region,
+            api_region,
+            machine_id: item.machine_id,
+            email: None,
+            subscription_title: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            disabled: false,
+        };
+
+        match self.token_manager.add_credential(new_cred).await {
+            Ok(credential_id) => ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Added,
+                reason: None,
+                credential_id: Some(credential_id),
+            },
+            Err(e) => ImportItemResult {
+                index,
+                fingerprint,
+                action: ImportAction::Invalid,
+                reason: Some(e.to_string()),
+                credential_id: None,
+            },
+        }
+    }
+
+    /// 生成凭据指纹（用于识别）
+    fn generate_fingerprint(item: &TokenJsonItem) -> String {
+        // 使用 refreshToken 前 16 字符作为指纹
+        // 使用 floor_char_boundary 安全截断，避免在多字节字符中间切割导致 panic
+        item.refresh_token
+            .as_ref()
+            .map(|rt| {
+                if rt.len() >= 16 {
+                    let end = floor_char_boundary(rt, 16);
+                    format!("{}...", &rt[..end])
+                } else {
+                    rt.clone()
+                }
+            })
+            .unwrap_or_else(|| "(empty)".to_string())
+    }
+
+    /// 映射 provider/authMethod 到标准 authMethod
+    fn map_auth_method(item: &TokenJsonItem) -> String {
+        // 优先使用 authMethod 字段
+        if let Some(auth) = &item.auth_method {
+            let auth_lower = auth.to_lowercase();
+            return match auth_lower.as_str() {
+                "idc" | "builder-id" | "builderid" => "idc".to_string(),
+                "social" => "social".to_string(),
+                _ => auth_lower,
+            };
+        }
+
+        // 回退到 provider 字段
+        if let Some(provider) = &item.provider {
+            let provider_lower = provider.to_lowercase();
+            return match provider_lower.as_str() {
+                "builderid" | "builder-id" | "idc" => "idc".to_string(),
+                "social" => "social".to_string(),
+                _ => "social".to_string(), // 默认 social
+            };
+        }
+
+        // 默认 social
+        "social".to_string()
     }
 }

@@ -351,8 +351,8 @@ fn sort_json_keys(value: &serde_json::Value) -> Result<String, serde_json::Error
 fn normalize_tool(tool: &Tool) -> String {
     let mut parts = Vec::new();
     parts.push(format!("name:{}", tool.name));
-    if !tool.description.is_empty() {
-        parts.push(format!("desc:{}", tool.description));
+    if let Some(description) = tool.description.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("desc:{}", description));
     }
     if !tool.input_schema.is_empty() {
         let schema_value = serde_json::to_value(&tool.input_schema).unwrap_or_default();
@@ -369,8 +369,8 @@ fn count_tool_tokens(tool: &Tool) -> i32 {
     if !tool.name.is_empty() {
         total += token::count_tokens(&tool.name) as i32;
     }
-    if !tool.description.is_empty() {
-        total += token::count_tokens(&tool.description) as i32;
+    if let Some(description) = tool.description.as_deref().filter(|s| !s.is_empty()) {
+        total += token::count_tokens(description) as i32;
     }
     if !tool.input_schema.is_empty() {
         let schema_value = serde_json::to_value(&tool.input_schema).unwrap_or_default();

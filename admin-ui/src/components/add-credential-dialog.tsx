@@ -22,7 +22,7 @@ type AuthMethod = 'social' | 'idc'
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
-  const [authRegion, setAuthRegion] = useState('')
+  const [region, setRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
@@ -37,7 +37,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setAuthMethod('social')
-    setAuthRegion('')
+    setRegion('')
     setApiRegion('')
     setClientId('')
     setClientSecret('')
@@ -67,7 +67,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         refreshToken: refreshToken.trim(),
         authMethod,
-        authRegion: authRegion.trim() || undefined,
+        region: region.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
@@ -137,17 +137,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
-                    value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
+                    id="region"
+                    placeholder="Region"
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
                     disabled={isPending}
                   />
                 </div>
                 <div>
                   <Input
                     id="apiRegion"
-                    placeholder="API Region"
+                    placeholder="API Region（可选覆盖）"
                     value={apiRegion}
                     onChange={(e) => setApiRegion(e.target.value)}
                     disabled={isPending}
@@ -155,7 +155,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                Region 用于 Token 刷新，留空使用全局配置。API Region 可单独覆盖 API 请求所用的 Region
               </p>
             </div>
 

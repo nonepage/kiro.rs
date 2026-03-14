@@ -563,6 +563,7 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
 
     if payload.stream {
         // 流式响应
@@ -573,6 +574,7 @@ pub async fn post_messages(
             total_input_tokens,
             thinking_enabled,
             cache_result,
+            user_id,
         )
         .await
     } else {
@@ -583,6 +585,7 @@ pub async fn post_messages(
             &payload.model,
             total_input_tokens,
             cache_result,
+            user_id,
         )
         .await
     }
@@ -596,9 +599,10 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     cache_result: cache::CacheResult,
+    user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -736,9 +740,10 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     cache_result: cache::CacheResult,
+    user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1146,6 +1151,7 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1155,6 +1161,7 @@ pub async fn post_messages_cc(
             &payload.model,
             cache_result,
             thinking_enabled,
+            user_id,
         )
         .await
     } else {
@@ -1165,6 +1172,7 @@ pub async fn post_messages_cc(
             &payload.model,
             total_input_tokens,
             cache_result,
+            user_id,
         )
         .await
     }
@@ -1180,9 +1188,10 @@ async fn handle_stream_request_buffered(
     model: &str,
     cache_result: cache::CacheResult,
     thinking_enabled: bool,
+    user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

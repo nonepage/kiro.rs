@@ -23,12 +23,24 @@ use super::types::{ContentBlock, MessagesRequest};
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {},
             "required": [],
             "additionalProperties": true
         });
     };
+
+    if !obj
+        .get("$schema")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "$schema".to_string(),
+            serde_json::Value::String("http://json-schema.org/draft-07/schema#".to_string()),
+        );
+    }
 
     // type（必须是字符串）
     if !obj
@@ -692,7 +704,7 @@ fn convert_tools(
     tools
         .iter()
         .filter_map(|t| {
-            if is_unsupported_tool(&t.name) || t.is_web_search() {
+            if t.name == "web_search" || t.is_web_search() {
                 tracing::debug!(tool = %t.name, "filtered unsupported web_search tool");
                 return None;
             }
@@ -708,6 +720,10 @@ fn convert_tools(
             if !suffix.is_empty() {
                 description.push('\n');
                 description.push_str(suffix);
+            }
+
+            if description.trim().is_empty() {
+                description = "Tool description unavailable.".to_string();
             }
 
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
@@ -1238,7 +1254,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1307,7 +1323,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1335,7 +1351,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -1700,21 +1716,23 @@ mod tests {
             AnthropicTool {
                 tool_type: Some("web_search_20250305".to_string()),
                 name: "web_search".to_string(),
-                description: String::new(),
+                description: Some(String::new()),
                 input_schema: HashMap::new(),
                 max_uses: Some(8),
+                cache_control: None,
             },
             // 普通工具（应保留）
             AnthropicTool {
                 tool_type: None,
                 name: "read_file".to_string(),
-                description: "Read a file from disk".to_string(),
+                description: Some("Read a file from disk".to_string()),
                 input_schema: {
                     let mut schema = HashMap::new();
                     schema.insert("type".to_string(), serde_json::json!("object"));
                     schema
                 },
                 max_uses: None,
+                cache_control: None,
             },
         ];
 
@@ -1738,16 +1756,18 @@ mod tests {
             AnthropicTool {
                 tool_type: Some("web_search_20250305".to_string()),
                 name: "web_search".to_string(),
-                description: String::new(),
+                description: Some(String::new()),
                 input_schema: HashMap::new(),
                 max_uses: Some(8),
+                cache_control: None,
             },
             AnthropicTool {
                 tool_type: Some("web_search_20260101".to_string()), // 假设的未来版本
                 name: "web_search".to_string(),
-                description: String::new(),
+                description: Some(String::new()),
                 input_schema: HashMap::new(),
                 max_uses: Some(10),
+                cache_control: None,
             },
         ];
 
@@ -1777,9 +1797,10 @@ mod tests {
             tools: Some(vec![AnthropicTool {
                 tool_type: None,
                 name: "mcp__ida-pro-mcp__patch_address_assembles".to_string(),
-                description: "".to_string(), // 上游可能拒绝空 description
-                input_schema,                // 故意不带 $schema 等字段
+                description: Some("".to_string()), // 上游可能拒绝空 description
+                input_schema,                      // 故意不带 $schema 等字段
                 max_uses: None,
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -1957,9 +1978,10 @@ mod tests {
             tools: Some(vec![AnthropicTool {
                 tool_type: None,
                 name: "read_file".to_string(),
-                description: "read".to_string(),
+                description: Some("read".to_string()),
                 input_schema: HashMap::new(),
                 max_uses: None,
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -2149,7 +2171,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req);
+        let result = convert_request(&req, &CompressionConfig::default());
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",

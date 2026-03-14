@@ -1,20 +1,19 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { BatchImportDialog } from '@/components/batch-import-dialog'
-import { KamImportDialog } from '@/components/kam-import-dialog'
+import { ImportTokenJsonDialog } from '@/components/import-token-json-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useCachedBalances, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -24,9 +23,9 @@ interface DashboardProps {
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [forceRefreshBalance, setForceRefreshBalance] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
-  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -48,10 +47,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
+  const { data: cachedBalancesData } = useCachedBalances()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+
+  // 构建 id -> cachedBalance 的映射
+  const cachedBalanceMap = new Map(
+    cachedBalancesData?.balances.map((b) => [b.id, b]) ?? []
+  )
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -108,8 +111,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
     document.documentElement.classList.toggle('dark')
   }
 
-  const handleViewBalance = (id: number) => {
+  const handleViewBalance = (id: number, forceRefresh: boolean) => {
     setSelectedCredentialId(id)
+    setForceRefreshBalance(forceRefresh)
+    if (forceRefresh) {
+      // 清除该凭据的余额缓存，强制重新获取
+      queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
+    }
     setBalanceDialogOpen(true)
   }
 
@@ -444,22 +452,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
-
-    setLoadBalancingMode(newMode, {
-      onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
-      },
-      onError: (error) => {
-        toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
-    })
-  }
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -498,15 +490,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -523,7 +506,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-2 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -542,19 +525,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
             </CardContent>
           </Card>
         </div>
@@ -626,13 +596,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
+              <Button variant="outline" onClick={() => setImportDialogOpen(true)} size="sm">
                 <Upload className="h-4 w-4 mr-2" />
-                批量导入
+                导入凭据
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
@@ -653,6 +619,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
+                    cachedBalance={cachedBalanceMap.get(credential.id)}
                     onViewBalance={handleViewBalance}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
@@ -695,7 +662,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <BalanceDialog
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}
-        onOpenChange={setBalanceDialogOpen}
+        onOpenChange={(open) => {
+          setBalanceDialogOpen(open)
+          if (!open) {
+            setForceRefreshBalance(false)
+            // 关闭弹窗时刷新缓存余额，让卡片显示最新数据
+            queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
+          }
+        }}
+        forceRefresh={forceRefreshBalance}
       />
 
       {/* 添加凭据对话框 */}
@@ -704,17 +679,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setAddDialogOpen}
       />
 
-      {/* 批量导入对话框 */}
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
+      {/* 导入凭据对话框 */}
+      <ImportTokenJsonDialog
+        open={importDialogOpen}
+        onOpenChange={setImportDialogOpen}
       />
 
-      {/* KAM 账号导入对话框 */}
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
-      />
 
       {/* 批量验活对话框 */}
       <BatchVerifyDialog

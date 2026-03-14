@@ -5,6 +5,7 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "credentialRpm": 120,
   "redisUrl": "redis://redis:6379",
   "cacheDebugLogging": false,
   "compression": {

@@ -19,10 +19,8 @@ use model::config::Config;
 
 #[tokio::main]
 async fn main() {
-    // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -30,7 +28,6 @@ async fn main() {
         )
         .init();
 
-    // 加载配置
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
@@ -39,33 +36,36 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
+        tracing::error!("加载凭据失败: {}", e);
         std::process::exit(1);
     });
 
-    // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
-
-    // 转换为按优先级排序的凭据列表
     let credentials_list = credentials_config.into_sorted_credentials();
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    #[cfg(feature = "sensitive-logs")]
+    tracing::debug!("主凭据: {:?}", first_credentials);
+    #[cfg(not(feature = "sensitive-logs"))]
+    tracing::debug!(
+        id = ?first_credentials.id,
+        priority = first_credentials.priority,
+        has_profile_arn = first_credentials.profile_arn.is_some(),
+        has_expires_at = first_credentials.expires_at.is_some(),
+        auth_method = ?first_credentials.auth_method.as_deref(),
+        "主凭据摘要"
+    );
 
-    // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
         tracing::error!("配置文件中未设置 apiKey");
         std::process::exit(1);
     });
 
-    // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
         let mut proxy = http_client::ProxyConfig::new(url);
         if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
@@ -74,11 +74,10 @@ async fn main() {
         proxy
     });
 
-    if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+    if let Some(proxy_url) = &config.proxy_url {
+        tracing::info!("已配置 HTTP 代理: {}", proxy_url);
     }
 
-    // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
         credentials_list,
@@ -91,9 +90,14 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    let init_count = token_manager.initialize_balances().await;
+    if init_count == 0 && token_manager.total_count() > 0 {
+        tracing::warn!("所有凭据余额初始化失败，将按优先级选择凭据");
+    }
+
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
-    // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
         api_key: config.count_tokens_api_key.clone(),
@@ -103,15 +107,12 @@ async fn main() {
     });
 
     anthropic::cache::set_debug_logging(config.cache_debug_logging);
-
-    // 初始化 Redis（如果配置了）
     if let Some(redis_url) = &config.redis_url {
         if let Err(e) = anthropic::cache::init_redis(redis_url).await {
             tracing::warn!("Failed to initialize Redis cache: {}", e);
         }
     }
 
-    // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
@@ -119,8 +120,6 @@ async fn main() {
         config.compression.clone(),
     );
 
-    // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
-    // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
     let admin_key_valid = config
         .admin_api_key
         .as_ref()
@@ -135,8 +134,6 @@ async fn main() {
             let admin_service = admin::AdminService::new(token_manager.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
-
-            // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
             tracing::info!("Admin API 已启用");
@@ -149,10 +146,16 @@ async fn main() {
         anthropic_app
     };
 
-    // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    #[cfg(feature = "sensitive-logs")]
+    tracing::debug!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    #[cfg(not(feature = "sensitive-logs"))]
+    tracing::info!(
+        "API Key: ***{} (长度: {})",
+        &api_key[api_key.len().saturating_sub(4)..],
+        api_key.len()
+    );
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -168,6 +171,14 @@ async fn main() {
         tracing::info!("  GET  /admin");
     }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("绑定监听地址失败 ({}): {}", addr, e);
+            std::process::exit(1);
+        });
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("HTTP 服务异常退出: {}", e);
+        std::process::exit(1);
+    }
 }
