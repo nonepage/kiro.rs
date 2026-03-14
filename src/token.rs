@@ -11,8 +11,8 @@ use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
 use crate::http_client::{ProxyConfig, build_client};
-use crate::image::estimate_image_tokens;
-use crate::model::config::TlsBackend;
+use crate::image::{estimate_image_tokens, estimate_transformed_image_tokens};
+use crate::model::config::{CompressionConfig, TlsBackend};
 use std::sync::OnceLock;
 
 /// Count Tokens API 配置
@@ -138,6 +138,24 @@ pub(crate) fn count_all_tokens(
     count_all_tokens_local(system, messages, tools)
 }
 
+/// 按当前压缩配置估算输入 tokens。
+///
+/// 含图片请求会走本地估算，以便反映图片压缩、GIF 抽帧等转换后的真实体量；
+/// 纯文本请求仍复用既有远程/本地计数逻辑。
+pub(crate) fn count_all_tokens_with_config(
+    model: String,
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+    compression_config: &CompressionConfig,
+) -> u64 {
+    if !messages_have_images(&messages) {
+        return count_all_tokens(model, system, messages, tools);
+    }
+
+    count_all_tokens_local_with_config(system, messages, tools, compression_config)
+}
+
 /// 调用远程 count_tokens API
 async fn call_remote_count_tokens(
     api_url: &str,
@@ -190,7 +208,17 @@ fn count_all_tokens_local(
     messages: Vec<Message>,
     tools: Option<Vec<Tool>>,
 ) -> u64 {
+    count_all_tokens_local_with_config(system, messages, tools, &CompressionConfig::default())
+}
+
+fn count_all_tokens_local_with_config(
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+    compression_config: &CompressionConfig,
+) -> u64 {
     let mut total = 0;
+    let total_image_count = count_images_in_messages(&messages);
 
     // 系统消息
     if let Some(ref system) = system {
@@ -212,8 +240,21 @@ fn count_all_tokens_local(
                 // 图片内容
                 if item.get("type").and_then(|v| v.as_str()) == Some("image") {
                     if let Some(source) = item.get("source") {
+                        let format = source
+                            .get("media_type")
+                            .and_then(|v| v.as_str())
+                            .and_then(media_type_to_format);
                         if let Some(data) = source.get("data").and_then(|v| v.as_str()) {
-                            if let Some((tokens, _, _)) = estimate_image_tokens(data) {
+                            if let Some(tokens) = format.and_then(|format| {
+                                estimate_transformed_image_tokens(
+                                    data,
+                                    format,
+                                    compression_config,
+                                    total_image_count,
+                                )
+                            }) {
+                                total += tokens;
+                            } else if let Some((tokens, _, _)) = estimate_image_tokens(data) {
                                 total += tokens;
                             }
                         }
@@ -238,6 +279,33 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
+fn messages_have_images(messages: &[Message]) -> bool {
+    count_images_in_messages(messages) > 0
+}
+
+fn count_images_in_messages(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|msg| match &msg.content {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("image"))
+                .count(),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn media_type_to_format(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "image/jpeg" => Some("jpeg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
@@ -256,4 +324,54 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame, Rgba, RgbaImage};
+
+    #[test]
+    fn test_count_all_tokens_with_config_counts_sampled_gif_frames() {
+        let frame_delay = Delay::from_numer_denom_ms(100, 1);
+        let mut frames = Vec::new();
+        for i in 0..40u8 {
+            let mut img = RgbaImage::new(64, 64);
+            for p in img.pixels_mut() {
+                *p = Rgba([i, 0, 0, 255]);
+            }
+            frames.push(Frame::from_parts(img, 0, 0, frame_delay));
+        }
+
+        let mut buf = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut buf);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            encoder.encode_frames(frames).unwrap();
+        }
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/gif",
+                    "data": BASE64.encode(&buf)
+                }
+            }]),
+        }];
+
+        let tokens = count_all_tokens_with_config(
+            "claude-sonnet-4".to_string(),
+            None,
+            messages,
+            None,
+            &CompressionConfig::default(),
+        );
+
+        assert_eq!(tokens, 100);
+    }
 }

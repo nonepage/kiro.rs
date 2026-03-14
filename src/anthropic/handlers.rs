@@ -86,9 +86,7 @@ fn adaptive_shrink_request_body(
     max_body: usize,
     request_body: &mut String,
 ) -> Result<Option<AdaptiveCompressionOutcome>, serde_json::Error> {
-    let img_bytes = total_image_bytes(kiro_request);
-    let effective_len = request_body.len().saturating_sub(img_bytes);
-    if max_body == 0 || effective_len <= max_body || !base_config.enabled {
+    if max_body == 0 || request_body.len() <= max_body || !base_config.enabled {
         return Ok(None);
     }
 
@@ -122,8 +120,7 @@ fn adaptive_shrink_request_body(
         (max_content_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
 
     for _ in 0..ADAPTIVE_COMPRESSION_MAX_ITERS {
-        let loop_img_bytes = total_image_bytes(kiro_request);
-        if request_body.len().saturating_sub(loop_img_bytes) <= max_body {
+        if request_body.len() <= max_body {
             break;
         }
 
@@ -415,14 +412,25 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_all_tokens_with_config(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
+            &state.compression_config,
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+    if websearch::should_reject_implicit_websearch(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Automatic web_search routing is not supported. Set tool_choice to web_search or use the explicit web search prefix.",
+            )),
+        )
+            .into_response();
     }
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("detected mixed tool list containing web_search, stripping before upstream");
@@ -472,9 +480,7 @@ pub async fn post_messages(
     };
 
     let max_body = state.compression_config.max_request_body_bytes;
-    let img_bytes = total_image_bytes(&kiro_request);
-    let effective_body_len = request_body.len().saturating_sub(img_bytes);
-    if max_body > 0 && effective_body_len > max_body && state.compression_config.enabled {
+    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
         match adaptive_shrink_request_body(
             &mut kiro_request,
             &state.compression_config,
@@ -509,17 +515,15 @@ pub async fn post_messages(
     }
 
     let final_img_bytes = total_image_bytes(&kiro_request);
-    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
-    if max_body > 0 && final_effective_len > max_body {
+    if max_body > 0 && request_body.len() > max_body {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "Request too large ({} bytes, {} image bytes excluded, {} effective, limit {}). Reduce conversation history or tool output.",
+                    "Request too large ({} bytes total, including {} image bytes, limit {}). Reduce conversation history or tool output.",
                     request_body.len(),
                     final_img_bytes,
-                    final_effective_len,
                     max_body
                 ),
             )),
@@ -533,11 +537,12 @@ pub async fn post_messages(
     let api_key = extract_api_key_from_headers(&headers);
 
     // 估算输入 tokens
-    let total_input_tokens = token::count_all_tokens(
+    let total_input_tokens = token::count_all_tokens_with_config(
         payload.model.clone(),
         payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
+        &state.compression_config,
     ) as i32;
 
     // 计算缓存断点并查询 Redis
@@ -926,6 +931,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
+    State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -934,11 +940,12 @@ pub async fn count_tokens(
         "Received POST /v1/messages/count_tokens request"
     );
 
-    let total_tokens = token::count_all_tokens(
+    let total_tokens = token::count_all_tokens_with_config(
         payload.model,
         payload.system,
         payload.messages,
         payload.tools,
+        &state.compression_config,
     ) as i32;
 
     Json(CountTokensResponse {
@@ -988,14 +995,25 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_all_tokens_with_config(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
+            &state.compression_config,
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+    if websearch::should_reject_implicit_websearch(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Automatic web_search routing is not supported. Set tool_choice to web_search or use the explicit web search prefix.",
+            )),
+        )
+            .into_response();
     }
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("detected mixed tool list containing web_search, stripping before upstream");
@@ -1045,9 +1063,7 @@ pub async fn post_messages_cc(
     };
 
     let max_body = state.compression_config.max_request_body_bytes;
-    let img_bytes = total_image_bytes(&kiro_request);
-    let effective_body_len = request_body.len().saturating_sub(img_bytes);
-    if max_body > 0 && effective_body_len > max_body && state.compression_config.enabled {
+    if max_body > 0 && request_body.len() > max_body && state.compression_config.enabled {
         match adaptive_shrink_request_body(
             &mut kiro_request,
             &state.compression_config,
@@ -1082,17 +1098,15 @@ pub async fn post_messages_cc(
     }
 
     let final_img_bytes = total_image_bytes(&kiro_request);
-    let final_effective_len = request_body.len().saturating_sub(final_img_bytes);
-    if max_body > 0 && final_effective_len > max_body {
+    if max_body > 0 && request_body.len() > max_body {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "Request too large ({} bytes, {} image bytes excluded, {} effective, limit {}). Reduce conversation history or tool output.",
+                    "Request too large ({} bytes total, including {} image bytes, limit {}). Reduce conversation history or tool output.",
                     request_body.len(),
                     final_img_bytes,
-                    final_effective_len,
                     max_body
                 ),
             )),
@@ -1106,11 +1120,12 @@ pub async fn post_messages_cc(
     let api_key = extract_api_key_from_headers(&headers);
 
     // 计算总 input tokens
-    let total_input_tokens = token::count_all_tokens(
+    let total_input_tokens = token::count_all_tokens_with_config(
         payload.model.clone(),
         payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
+        &state.compression_config,
     ) as i32;
 
     // 计算缓存断点并查询 Redis

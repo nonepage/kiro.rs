@@ -174,9 +174,14 @@ pub fn should_handle_websearch_request(req: &MessagesRequest) -> bool {
         return false;
     }
 
-    tool_choice_requests_web_search(req)
-        || is_only_web_search_tool(req)
-        || request_explicit_web_search_prefix(req)
+    tool_choice_requests_web_search(req) || request_explicit_web_search_prefix(req)
+}
+
+pub fn should_reject_implicit_websearch(req: &MessagesRequest) -> bool {
+    has_web_search_tool(req)
+        && is_only_web_search_tool(req)
+        && !tool_choice_requests_web_search(req)
+        && !request_explicit_web_search_prefix(req)
 }
 
 pub fn strip_web_search_tools(req: &mut MessagesRequest) {
@@ -700,9 +705,10 @@ mod tests {
             tools: Some(vec![Tool {
                 tool_type: Some("web_search_20250305".to_string()),
                 name: "web_search".to_string(),
-                description: String::new(),
+                description: Some(String::new()),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -711,6 +717,38 @@ mod tests {
         };
 
         assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_single_web_search_tool_requires_explicit_routing() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("what's new in rust"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: Some(String::new()),
+                input_schema: Default::default(),
+                max_uses: Some(8),
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
+        assert!(should_reject_implicit_websearch(&req));
     }
 
     #[test]
@@ -730,16 +768,18 @@ mod tests {
                 Tool {
                     tool_type: Some("web_search_20250305".to_string()),
                     name: "web_search".to_string(),
-                    description: String::new(),
+                    description: Some(String::new()),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
                     name: "other_tool".to_string(),
-                    description: "Other tool".to_string(),
+                    description: Some("Other tool".to_string()),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,
@@ -748,8 +788,43 @@ mod tests {
             metadata: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
-        assert!(!has_web_search_tool(&req));
+        // 多个工具时仍应识别到包含 web_search，但不应走纯 websearch 专用处理流
+        assert!(has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
+    }
+
+    #[test]
+    fn test_explicit_tool_choice_handles_web_search() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("latest rust news"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: Some(String::new()),
+                input_schema: Default::default(),
+                max_uses: Some(8),
+                cache_control: None,
+            }]),
+            tool_choice: Some(serde_json::json!({
+                "type": "tool",
+                "name": "web_search"
+            })),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(should_handle_websearch_request(&req));
+        assert!(!should_reject_implicit_websearch(&req));
     }
 
     #[test]

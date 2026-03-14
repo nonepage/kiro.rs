@@ -257,6 +257,31 @@ pub fn estimate_image_tokens(base64_data: &str) -> Option<(u64, u32, u32)> {
     Some((tokens, width, height))
 }
 
+/// 估算图片经过请求转换后的 token 数。
+///
+/// 该估算会尽量贴近实际发送到上游的图片形态：
+/// - GIF 按抽帧后的多张静态图求和
+/// - 其他图片按压缩/重编码后的最终尺寸计算
+/// - 若处理失败，则回退到基于原图尺寸的估算
+pub fn estimate_transformed_image_tokens(
+    base64_data: &str,
+    format: &str,
+    config: &CompressionConfig,
+    image_count: usize,
+) -> Option<u64> {
+    if format.eq_ignore_ascii_case("gif") {
+        if let Ok(gif) = process_gif_frames(base64_data, config, image_count) {
+            return Some(gif.frames.into_iter().map(|frame| frame.tokens).sum());
+        }
+    }
+
+    if let Ok(result) = process_image(base64_data, format, config, image_count) {
+        return Some(result.tokens);
+    }
+
+    estimate_image_tokens(base64_data).map(|(tokens, _, _)| tokens)
+}
+
 /// 处理图片：根据配置缩放并返回处理结果
 ///
 /// # 参数
