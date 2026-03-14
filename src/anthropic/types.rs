@@ -115,6 +115,7 @@ pub struct Metadata {
 #[derive(Debug, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -127,6 +128,10 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+fn default_max_tokens() -> i32 {
+    4096
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -198,6 +203,8 @@ pub struct Message {
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    #[serde(rename = "type", default)]
+    pub message_type: Option<String>,
     pub text: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,7 +236,7 @@ pub struct Tool {
     pub name: String,
     /// 工具描述（普通工具必需，WebSearch 工具可选）
     #[serde(default)]
-    pub description: String,
+    pub description: Option<String>,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
     #[serde(default)]
     pub input_schema: HashMap<String, serde_json::Value>,

@@ -530,7 +530,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
     tools
         .iter()
         .map(|t| {
-            let mut description = t.description.clone();
+            let mut description = t.description.clone().unwrap_or_default();
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {

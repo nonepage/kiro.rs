@@ -215,7 +215,9 @@ fn count_all_tokens_local(
     if let Some(ref tools) = tools {
         for tool in tools {
             total += count_tokens(&tool.name);
-            total += count_tokens(&tool.description);
+            if let Some(ref desc) = tool.description {
+                total += count_tokens(desc);
+            }
             let input_schema_json = serde_json::to_string(&tool.input_schema).unwrap_or_default();
             total += count_tokens(&input_schema_json);
         }
