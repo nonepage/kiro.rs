@@ -197,9 +197,9 @@ fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
-
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if is_input_too_long_error(&err) && err.to_string().contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+    if is_input_too_long_error(&err) && err.to_string().contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+    {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
             StatusCode::BAD_REQUEST,

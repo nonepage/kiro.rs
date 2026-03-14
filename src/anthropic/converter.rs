@@ -279,8 +279,13 @@ pub fn convert_request(
     let mut tools = convert_tools(&req.tools, compression_config.tool_description_max_chars);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history =
-        build_history(req, messages, &model_id, compression_config, total_image_count)?;
+    let mut history = build_history(
+        req,
+        messages,
+        &model_id,
+        compression_config,
+        total_image_count,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -345,7 +350,8 @@ pub fn convert_request(
         .with_current_message(current_message)
         .with_history(history);
 
-    let compression_stats = super::compressor::compress(&mut conversation_state, compression_config);
+    let compression_stats =
+        super::compressor::compress(&mut conversation_state, compression_config);
     if compression_stats.total_saved() > 0 || compression_stats.history_turns_removed > 0 {
         tracing::info!(
             whitespace_saved = compression_stats.whitespace_saved,
@@ -400,8 +406,11 @@ fn process_message_content(
                                             total_image_count,
                                         ) {
                                             Ok(gif) => {
-                                                let total_final_bytes: usize =
-                                                    gif.frames.iter().map(|f| f.final_bytes_len).sum();
+                                                let total_final_bytes: usize = gif
+                                                    .frames
+                                                    .iter()
+                                                    .map(|f| f.final_bytes_len)
+                                                    .sum();
                                                 tracing::info!(
                                                     duration_ms = gif.duration_ms,
                                                     source_frames = gif.source_frames,
@@ -438,18 +447,20 @@ fn process_message_content(
                                                             compression_config,
                                                             total_image_count,
                                                         ) {
-                                                            Ok(result) => images.push(
-                                                                KiroImage::from_base64(
-                                                                    format,
-                                                                    result.data,
-                                                                ),
-                                                            ),
-                                                            Err(final_err) => {
-                                                                tracing::warn!(error = %final_err, "image processing failed, using original image payload");
+                                                            Ok(result) => {
                                                                 images.push(KiroImage::from_base64(
                                                                     format,
-                                                                    source.data,
-                                                                ));
+                                                                    result.data,
+                                                                ))
+                                                            }
+                                                            Err(final_err) => {
+                                                                tracing::warn!(error = %final_err, "image processing failed, using original image payload");
+                                                                images.push(
+                                                                    KiroImage::from_base64(
+                                                                        format,
+                                                                        source.data,
+                                                                    ),
+                                                                );
                                                             }
                                                         }
                                                     }
@@ -473,11 +484,17 @@ fn process_message_content(
                                                         "processed image payload"
                                                     );
                                                 }
-                                                images.push(KiroImage::from_base64(format, result.data));
+                                                images.push(KiroImage::from_base64(
+                                                    format,
+                                                    result.data,
+                                                ));
                                             }
                                             Err(err) => {
                                                 tracing::warn!(error = %err, "failed to process image payload, using original data");
-                                                images.push(KiroImage::from_base64(format, source.data));
+                                                images.push(KiroImage::from_base64(
+                                                    format,
+                                                    source.data,
+                                                ));
                                             }
                                         }
                                     }

@@ -349,7 +349,12 @@ pub fn process_image(
 
         (data, size, bytes_len, was_reencoded)
     } else {
-        (base64_data.to_string(), original_size, original_bytes_len, false)
+        (
+            base64_data.to_string(),
+            original_size,
+            original_bytes_len,
+            false,
+        )
     };
 
     let tokens = calculate_tokens(final_size.0, final_size.1);

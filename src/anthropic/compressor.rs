@@ -93,10 +93,7 @@ pub fn compress(state: &mut ConversationState, config: &CompressionConfig) -> Co
 
     let repaired_non_empty_contents = repair_non_empty_content_pass(state);
     if repaired_non_empty_contents > 0 {
-        tracing::debug!(
-            repaired_non_empty_contents,
-            "压缩后已修复空 content 占位符"
-        );
+        tracing::debug!(repaired_non_empty_contents, "压缩后已修复空 content 占位符");
     }
 
     stats
@@ -861,10 +858,8 @@ mod tests {
 
         let user_with_tool_result = Message::User(HistoryUserMessage {
             user_input_message: UserMessage::new(" ", "claude-sonnet-4.5").with_context(
-                UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
-                    tool_use_id,
-                    "ok",
-                )]),
+                UserInputMessageContext::new()
+                    .with_tool_results(vec![ToolResult::success(tool_use_id, "ok")]),
             ),
         });
 
@@ -891,7 +886,12 @@ mod tests {
 
         if let Message::User(u) = &state.history[1] {
             assert_eq!(u.user_input_message.content, ".");
-            assert!(u.user_input_message.user_input_message_context.tool_results.is_empty());
+            assert!(
+                u.user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty()
+            );
         } else {
             panic!("expected User message");
         }
@@ -1116,18 +1116,15 @@ mod tests {
         // 当按 user+assistant 成对从前往后截断时，容易删掉 tool_use 而保留 tool_result。
         let tool_use_id = "tooluse_1";
 
-        let system_user = Message::User(HistoryUserMessage::new(
-            "system",
-            "claude-sonnet-4.5",
-        ));
+        let system_user = Message::User(HistoryUserMessage::new("system", "claude-sonnet-4.5"));
         let system_assistant = Message::Assistant(HistoryAssistantMessage::new(
             "I will follow these instructions.",
         ));
 
         let user1 = Message::User(HistoryUserMessage::new("do something", "claude-sonnet-4.5"));
 
-        let tool_use = ToolUseEntry::new(tool_use_id, "Read")
-            .with_input(serde_json::json!({"path": "a.txt"}));
+        let tool_use =
+            ToolUseEntry::new(tool_use_id, "Read").with_input(serde_json::json!({"path": "a.txt"}));
         let assistant1 = Message::Assistant(HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new(" ").with_tool_uses(vec![tool_use]),
         });
