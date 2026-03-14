@@ -251,7 +251,7 @@ pub async fn post_messages(
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    if websearch::should_handle_websearch_request(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -263,6 +263,10 @@ pub async fn post_messages(
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("detected mixed tool list containing web_search, stripping before upstream");
+        websearch::strip_web_search_tools(&mut payload);
     }
 
     // 转换请求
@@ -764,7 +768,7 @@ pub async fn post_messages_cc(
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    if websearch::should_handle_websearch_request(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -776,6 +780,10 @@ pub async fn post_messages_cc(
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("detected mixed tool list containing web_search, stripping before upstream");
+        websearch::strip_web_search_tools(&mut payload);
     }
 
     // 转换请求

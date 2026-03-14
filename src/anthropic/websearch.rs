@@ -18,6 +18,8 @@ use uuid::Uuid;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
+const WEB_SEARCH_PREFIX: &str = "Perform a web search for the query: ";
+
 /// MCP 请求
 #[derive(Debug, Serialize)]
 pub struct McpRequest {
@@ -98,25 +100,108 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-/// 检查请求是否为纯 WebSearch 请求
-///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 检查请求是否包含 WebSearch 工具
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
+        tools
+            .iter()
+            .any(|t| t.name == "web_search" || t.is_web_search())
     })
+}
+
+fn tool_choice_requests_web_search(req: &MessagesRequest) -> bool {
+    let Some(choice) = req.tool_choice.as_ref() else {
+        return false;
+    };
+    let Some(obj) = choice.as_object() else {
+        return false;
+    };
+
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("tool_name").and_then(|v| v.as_str()));
+    if name != Some("web_search") {
+        return false;
+    }
+
+    match obj.get("type").and_then(|v| v.as_str()) {
+        Some("tool") => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn is_only_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.len() == 1
+            && tools
+                .first()
+                .is_some_and(|t| t.name == "web_search" || t.is_web_search())
+    })
+}
+
+fn extract_last_user_text(req: &MessagesRequest) -> Option<String> {
+    let msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| req.messages.last())?;
+
+    match &msg.content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let first_block = arr.first()?;
+            if first_block.get("type")?.as_str()? == "text" {
+                Some(first_block.get("text")?.as_str()?.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn request_explicit_web_search_prefix(req: &MessagesRequest) -> bool {
+    extract_last_user_text(req)
+        .map(|t| t.trim_start().starts_with(WEB_SEARCH_PREFIX))
+        .unwrap_or(false)
+}
+
+pub fn should_handle_websearch_request(req: &MessagesRequest) -> bool {
+    if !has_web_search_tool(req) {
+        return false;
+    }
+
+    tool_choice_requests_web_search(req)
+        || is_only_web_search_tool(req)
+        || request_explicit_web_search_prefix(req)
+}
+
+pub fn strip_web_search_tools(req: &mut MessagesRequest) {
+    if let Some(tools) = req.tools.as_mut() {
+        tools.retain(|t| t.name != "web_search" && !t.is_web_search());
+        if tools.is_empty() {
+            req.tools = None;
+        }
+    }
 }
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
+/// 读取 messages 中最后一条 user 消息的第一个内容块
 /// 并去除 "Perform a web search for the query: " 前缀
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    let msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| req.messages.last())?;
 
     // 提取文本内容
-    let text = match &first_msg.content {
+    let text = match &msg.content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
             // 获取第一个内容块
@@ -131,13 +216,13 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
     };
 
     // 去除前缀 "Perform a web search for the query: "
-    const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
+    let query = if text.starts_with(WEB_SEARCH_PREFIX) {
+        text[WEB_SEARCH_PREFIX.len()..].to_string()
     } else {
         text
     };
 
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.is_empty() { None } else { Some(query) }
 }
 
@@ -501,18 +586,71 @@ pub async fn handle_websearch_request(
         }
     };
 
-    // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    if payload.stream {
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    let summary = generate_search_summary(&query, &search_results);
+    let search_content = if let Some(ref results) = search_results {
+        results
+            .results
+            .iter()
+            .map(|r| {
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "page_age": null
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+
+    let response_body = json!({
+        "id": format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": { "query": query }
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content
+            },
+            {
+                "type": "text",
+                "text": summary
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    (StatusCode::OK, Json(response_body)).into_response()
 }
 
 /// 调用 Kiro MCP API

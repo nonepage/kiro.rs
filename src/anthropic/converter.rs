@@ -529,7 +529,12 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
     tools
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
+            if is_unsupported_tool(&t.name) || t.is_web_search() {
+                tracing::debug!(tool = %t.name, "filtered unsupported web_search tool");
+                return None;
+            }
+
             let mut description = t.description.clone().unwrap_or_default();
 
             // 对 Write/Edit 工具追加自定义描述后缀
@@ -549,7 +554,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 None => description,
             };
 
-            Tool {
+            Some(Tool {
                 tool_specification: ToolSpecification {
                     name: t.name.clone(),
                     description,
@@ -557,7 +562,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                         t.input_schema
                     ))),
                 },
-            }
+            })
         })
         .collect()
 }
@@ -765,6 +770,53 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
+                            }
+                        }
+                        "server_tool_use" => {}
+                        "web_search_tool_result" => {
+                            if let Some(serde_json::Value::Array(results)) = block.content {
+                                for result in &results {
+                                    if result.get("type").and_then(|t| t.as_str())
+                                        != Some("web_search_result")
+                                    {
+                                        continue;
+                                    }
+
+                                    let title =
+                                        result.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                                    let url =
+                                        result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                    if url.is_empty() {
+                                        continue;
+                                    }
+
+                                    let snippet = result
+                                        .get("encrypted_content")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("");
+                                    let page_age = result
+                                        .get("page_age")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("");
+                                    let clean_title: String =
+                                        title.chars().filter(|c| !c.is_control()).collect();
+                                    let clean_snippet: String =
+                                        snippet.chars().filter(|c| !c.is_control()).collect();
+
+                                    if clean_title.is_empty() {
+                                        text_content.push_str(&format!("{}\n", url));
+                                    } else {
+                                        text_content
+                                            .push_str(&format!("{}: {}\n", clean_title, url));
+                                    }
+                                    if !page_age.is_empty() {
+                                        text_content.push_str(&format!("Date: {}\n", page_age));
+                                    }
+                                    if !clean_snippet.is_empty() {
+                                        text_content.push_str(&format!("{}\n", clean_snippet));
+                                    }
+                                    text_content.push('\n');
+                                }
                             }
                         }
                         _ => {}
